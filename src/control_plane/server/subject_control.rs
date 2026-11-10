@@ -790,9 +790,25 @@ pub(super) fn cancel_target(
     let internal = |error: String| Refusal::new(Code::Internal, error);
     let (execution, claim, target) = match (&params.subject_id, &params.spawn_request_id) {
         (Some(subject_id), None) => {
-            let subject = subjects::current_attachment(registry, subject_id)
-                .map_err(internal)?
-                .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
+            // The caller names which attachment it saw, so the execution acted on
+            // is the one that claim belongs to — a reserved successor is a
+            // legitimate target while the grant it will succeed is still current.
+            let subject = match params.claim_id.as_ref() {
+                Some(claim_id) => subjects::read_claim(registry, claim_id)
+                    .map_err(internal)?
+                    .filter(|claim| &claim.subject_id == subject_id)
+                    .ok_or_else(|| {
+                        Refusal::new(
+                            Code::Refused,
+                            "the requested claim is not current; nothing was signalled",
+                        )
+                    })?,
+                None => subjects::current_attachment(registry, subject_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        Refusal::new(Code::NotFound, "launch subject is not recorded")
+                    })?,
+            };
             (
                 subject.process.registration_id.clone(),
                 Some(subject),

@@ -39,6 +39,25 @@ Not planned: an async rewrite of the domain actor (Tokio is already used for
 transport; the actor's sync loop is measurement-driven only), a generic RPC or
 operation framework, or one transport for every method.
 
+## Landed: supervisor completion finalises the execution
+
+Both `radar run --launch` and operator-run `radar run [--agent] -- CMD` already
+share `supervise`: the parent waits and reports `launch.complete`, and the
+admitted child enters its scope and becomes the program. This was explicit in
+`unified-managed-lifecycle` design decision 4 and commit `9db47a546abe`.
+
+`record_completion` now records the authenticated report, establishes the
+execution end and settles its outstanding claims through `record_exit_locked`,
+the same settlement a verified exit uses; `record_exit` delegates to it rather
+than keeping a second copy. Session shutdown remains the normal exact-claim
+release, and the tmux wake and process sweep remain fallback observations into
+that one settlement. Spontaneous completion still retains terminal output, so
+finalisation never authorises pane removal.
+
+Remaining model work in the change is the ownership split (a claim still embeds
+a process snapshot), the shared constructor, and the registration-rooted
+publication and rows.
+
 ## Subsequent refactor: durable execution and response completion
 
 After the current [`unified-execution-lifecycle`](openspec/changes/unified-execution-lifecycle/proposal.md)

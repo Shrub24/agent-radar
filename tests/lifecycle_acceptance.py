@@ -98,13 +98,15 @@ class Acceptance:
             identity = {{"pid": os.getpid(), "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                         "start_ticks": int(Path("/proc/self/stat").read_text().rsplit(") ", 1)[1].split()[19])}}
             report = {{"source": "herdsman-pi", "incarnation": str(uuid.uuid4()), "session_id": session,
-                      "claim_id": str(uuid.uuid4()), "process": identity,
+                      "process": identity,
                       "registration_id": os.environ.pop("PI_RADAR_REGISTRATION_ID", None),
                       "label": "lifecycle-acceptance-agent",
                       "location": {{"backend": "tmux", "instance": {self.server!r},
                                    "pane": "tmux:{self.server}:" + os.environ["TMUX_PANE"]}}}}
             granted = call(root / "control.sock", "agent.presence", report)
             assert granted["standing"] == "granted", granted
+            # Radar mints the attachment; the client carries the ID it answered with.
+            report["claim_id"] = granted["claim_id"]
             report["registration_id"] = granted["registration_id"]
             publisher = {{"source": report["source"], "incarnation": report["incarnation"]}}
             writer = call(root / "control.sock", "agent.acquire", {{"registration_id": report["registration_id"],

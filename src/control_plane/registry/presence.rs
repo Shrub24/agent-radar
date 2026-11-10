@@ -178,7 +178,7 @@ pub fn decision(registry: &Registry, claim_id: &ClaimId) -> Result<Option<Decisi
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .facts(claim_id)
-        .map(|facts| Decision::of(claim_id, &facts.attachment)))
+        .map(|facts| Decision::of(claim_id, &facts)))
 }
 
 /// The newest claim one registration made, whatever its standing.
@@ -190,9 +190,7 @@ pub fn current(
     let Some(claim) = log.claim_of_registration(registration_id) else {
         return Ok(None);
     };
-    Ok(log
-        .facts(&claim)
-        .map(|facts| Decision::of(&claim, &facts.attachment)))
+    Ok(log.facts(&claim).map(|facts| Decision::of(&claim, &facts)))
 }
 
 /// The authority a registration holds now. A pending, reserved, duplicate or

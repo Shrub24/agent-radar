@@ -166,7 +166,6 @@ pub fn observe_exit_from(
             }),
             now_ms,
         )?;
-        super::sync_claim(registry, registration_id)?;
     }
     match acquired {
         Ok(Acquired::Process(_)) => Ok(false),
@@ -229,7 +228,6 @@ pub fn observe_pane(
             // A contradicting observation clears pending confirmation.
             if current.pane_absence.take().is_some() {
                 record(Transition::AbsencePending(None))?;
-                super::sync_claim(registry, registration_id)?;
             }
             Ok(false)
         }
@@ -258,11 +256,9 @@ pub fn observe_pane(
                     confirmations: pending.confirmations,
                     observed_at: at.clone(),
                 }))?;
-                super::sync_claim(registry, registration_id)?;
                 return Ok(true);
             }
             record(Transition::AbsencePending(Some(pending)))?;
-            super::sync_claim(registry, registration_id)?;
             Ok(false)
         }
     }

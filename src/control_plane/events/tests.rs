@@ -231,7 +231,7 @@ fn attachment_views_share_process_evidence_across_replay() {
     {
         let mut log = registry.events.lock().unwrap();
         log.append(
-            Stream::Claim(ticket.claim_id.as_ref().expect("a claim")),
+            Stream::Process(&ticket.registration_id),
             "2026-01-01T00:00:00.000Z",
             Source::Bootstrap,
             Transition::Captured(ProcessIdentity {
@@ -249,32 +249,35 @@ fn attachment_views_share_process_evidence_across_replay() {
             Stream::Claim(&next_claim),
             "2026-01-01T00:00:01.000Z",
             Source::Registration,
-            Transition::Enrolled(before_signal.clone()),
+            Transition::Enrolled(Box::new(before_signal.clone())),
         )
         .unwrap();
+        // Process evidence belongs to the execution's own stream.
         log.append(
-            Stream::Claim(&next_claim),
+            Stream::Process(&ticket.registration_id),
             "2026-01-01T00:00:02.000Z",
             Source::ProcessControl,
             Transition::SignalRequested,
         )
         .unwrap();
         assert!(
-            log.facts(ticket.claim_id.as_ref().expect("a claim"))
-                .unwrap()
-                .execution
+            log.process(&ticket.registration_id)
+                .expect("the execution")
                 .signalled_at
                 .is_some()
         );
-        assert!(
-            log.append(
-                Stream::Claim(&ClaimId::random()),
-                "2026-01-01T00:00:03.000Z",
-                Source::Registration,
-                Transition::Enrolled(before_signal)
-            )
-            .is_err(),
-            "a stale attachment cannot erase the signal"
+        let stale = ClaimId::random();
+        log.append(
+            Stream::Claim(&stale),
+            "2026-01-01T00:00:03.000Z",
+            Source::Registration,
+            Transition::Enrolled(Box::new(before_signal)),
+        )
+        .unwrap();
+        assert_eq!(
+            log.facts(&stale).expect("the attachment"),
+            log.facts(&next_claim).expect("the attachment"),
+            "an attachment carries no execution facts of its own"
         );
     }
     drop(registry);

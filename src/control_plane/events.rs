@@ -64,9 +64,12 @@ const MAX_EVENT_BYTES: usize = 16 * 1024;
 /// A secret-free baseline for explicitly imported records and new subjects.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Facts {
-    pub attachment: AttachmentFacts,
-    pub execution: ProcessFacts,
+/// What a stream's reduction produced. An attachment and an execution are
+/// separate records: a claim owns who is attached, an execution owns what the
+/// process did.
+pub enum Recorded {
+    Attachment(Box<AttachmentFacts>),
+    Execution(Box<ProcessFacts>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -140,20 +143,17 @@ pub struct ProcessFacts {
     pub recorded_at: String,
 }
 
-impl Facts {
-    pub fn from_subject(subject: &Claim) -> Self {
+impl AttachmentFacts {
+    pub fn of(subject: &Claim) -> Self {
         Self {
-            attachment: AttachmentFacts {
-                registration_id: subject.process.registration_id.clone(),
-                subject_id: Some(subject.subject_id.clone()),
-                managed: subject.managed.clone(),
-                session: subject.session.clone(),
-                // Standing is recorded by its own transition, never implied by
-                // writing an attachment: this baseline describes the facts.
-                standing: Standing::Pending,
-                granted_at: None,
-            },
-            execution: ProcessFacts::from(&subject.process),
+            registration_id: subject.process.registration_id.clone(),
+            subject_id: Some(subject.subject_id.clone()),
+            managed: subject.managed.clone(),
+            session: subject.session.clone(),
+            // Standing is recorded by its own transition, never implied by
+            // writing an attachment: this baseline describes the facts.
+            standing: Standing::Pending,
+            granted_at: None,
         }
     }
 }
@@ -211,10 +211,10 @@ impl ProcessFacts {
 pub enum Transition {
     ProcessCreated {
         registration_id: RegistrationId,
-        facts: ProcessFacts,
+        facts: Box<ProcessFacts>,
     },
-    Created(Facts),
-    Enrolled(Facts),
+    Created(Box<AttachmentFacts>),
+    Enrolled(Box<AttachmentFacts>),
     Captured(ProcessIdentity),
     Bound {
         registration_id: RegistrationId,
@@ -360,14 +360,6 @@ pub struct Log {
     failed: bool,
 }
 
-impl std::fmt::Debug for Facts {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Facts")
-            .field("state", &self.execution.state)
-            .finish_non_exhaustive()
-    }
-}
-
 impl Log {
     pub fn open(directory: &Path) -> Result<Self, String> {
         prepare_directory(directory)?;
@@ -476,16 +468,10 @@ impl Log {
         Ok(events)
     }
 
-    pub fn facts(&self, claim_id: &ClaimId) -> Option<Facts> {
-        let attachment = self.facts.get(claim_id)?;
-        let execution = self
-            .processes
-            .get(&attachment.registration_id)
-            .expect("every attachment references its recorded process");
-        Some(Facts {
-            attachment: attachment.clone(),
-            execution: execution.clone(),
-        })
+    /// The attachment a claim records. The execution it names is read from the
+    /// process stream, never copied here.
+    pub fn facts(&self, claim_id: &ClaimId) -> Option<AttachmentFacts> {
+        self.facts.get(claim_id).cloned()
     }
     pub fn process(&self, registration_id: &RegistrationId) -> Option<&ProcessFacts> {
         self.processes.get(registration_id)
@@ -563,7 +549,7 @@ impl Log {
     }
 
     /// Materialized attachment views over the one process owner per registration.
-    pub fn all_facts(&self) -> Vec<(ClaimId, Facts)> {
+    pub fn all_facts(&self) -> Vec<(ClaimId, AttachmentFacts)> {
         self.facts
             .keys()
             .map(|id| (id.clone(), self.facts(id).expect("recorded attachment")))
@@ -582,11 +568,14 @@ impl Log {
         at: &str,
         source: Source,
         transition: Transition,
-        expected: &Facts,
+        expected: &AttachmentFacts,
     ) -> Result<(), String> {
         let stream = Stream::Claim(claim_id);
         let event = self.event(stream, at, source.clone(), transition.clone());
-        if &self.reduce_event(stream, &event)? != expected {
+        let Recorded::Attachment(next) = self.reduce_event(stream, &event)? else {
+            return Err("a claim transition produced an execution".into());
+        };
+        if next.as_ref() != expected {
             return Err("lifecycle transition changes unrelated facts".into());
         }
         self.append(stream, at, source, transition)
@@ -672,34 +661,21 @@ impl Log {
         Ok(())
     }
 
-    fn reduce_event(&self, stream: Stream<'_>, event: &Event) -> Result<Facts, String> {
-        let previous = match stream {
-            Stream::Claim(id) => self.facts(id),
-            Stream::Process(id) => self.processes.get(id).map(|execution| Facts {
-                attachment: AttachmentFacts {
-                    registration_id: id.clone(),
-                    subject_id: None,
-                    managed: Default::default(),
-                    session: None,
-                    standing: Standing::Pending,
-                    granted_at: None,
-                },
-                execution: execution.clone(),
-            }),
-            Stream::Container(_) => return Err("a container has no lifecycle facts".into()),
-        };
-        let mut next = reduce(previous.as_ref(), event)?;
-        if previous.is_none()
-            && let Some(process) = self.processes.get(&next.attachment.registration_id)
-        {
-            // A new attachment can reference an existing process, never reset
-            // its recipe identity, birth, signal, exit or replacement evidence.
-            next.execution.recorded_at = process.recorded_at.clone();
-            if &next.execution != process {
-                return Err("a new attachment cannot replace existing process facts".into());
+    fn reduce_event(&self, stream: Stream<'_>, event: &Event) -> Result<Recorded, String> {
+        match stream {
+            Stream::Claim(id) => {
+                let attachment = self.facts.get(id);
+                let execution = attachment.and_then(|a| self.processes.get(&a.registration_id));
+                Ok(Recorded::Attachment(Box::new(reduce_attachment(
+                    attachment, execution, event,
+                )?)))
             }
+            Stream::Process(id) => Ok(Recorded::Execution(Box::new(reduce_process(
+                self.processes.get(id),
+                event,
+            )?))),
+            Stream::Container(_) => Err("a container has no lifecycle facts".into()),
         }
-        Ok(next)
     }
 
     fn persist(&mut self, event: &Event) -> Result<(), String> {
@@ -771,21 +747,25 @@ impl Log {
                 },
             ) => {
                 self.validate_process_creation(id, registration_id)?;
-                self.processes.insert(id.clone(), facts.clone());
+                self.processes.insert(id.clone(), facts.as_ref().clone());
             }
             (Stream::Container(id), _) => {
                 let container = reduce_container(self.containers.get(id), event)?;
                 self.containers.insert(id.to_owned(), container);
             }
-            _ => {
-                let facts = self.reduce_event(stream, event)?;
-                self.processes
-                    .insert(facts.attachment.registration_id.clone(), facts.execution);
-                if let Stream::Claim(claim) = stream {
-                    self.facts.insert(claim.clone(), facts.attachment);
-                    self.claim_seq.insert(claim.clone(), event.seq);
+            _ => match self.reduce_event(stream, event)? {
+                Recorded::Attachment(attachment) => {
+                    if let Stream::Claim(claim) = stream {
+                        self.facts.insert(claim.clone(), *attachment);
+                        self.claim_seq.insert(claim.clone(), event.seq);
+                    }
                 }
-            }
+                Recorded::Execution(execution) => {
+                    if let Stream::Process(id) = stream {
+                        self.processes.insert(id.clone(), *execution);
+                    }
+                }
+            },
         }
         self.last_subject_event
             .insert(key.to_owned(), event.event_id.clone());
@@ -793,145 +773,143 @@ impl Log {
     }
 }
 
-fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
+/// Applies a claim transition. Standing, its subject and its session are the
+/// claim's own facts; anything it asks about the process is read from the
+/// execution record rather than kept in step here.
+fn reduce_attachment(
+    previous: Option<&AttachmentFacts>,
+    execution: Option<&ProcessFacts>,
+    event: &Event,
+) -> Result<AttachmentFacts, String> {
     let mut facts = match (&event.transition, previous) {
         (Transition::Created(facts) | Transition::Enrolled(facts), None) => {
-            return Ok(facts.clone());
+            return Ok(facts.as_ref().clone());
         }
         (_, Some(facts)) => facts.clone(),
         _ => return Err("lifecycle transition has no baseline".into()),
     };
+    let ended = execution.is_none_or(|execution| {
+        execution.exited_at.is_some() || execution.ended_externally_at.is_some()
+    });
     match &event.transition {
-        Transition::Captured(process) if facts.execution.state == State::Pending => {
-            facts.execution.state = State::Captured;
-            facts.execution.process = Some(process.clone());
+        Transition::SessionRecorded { session } if facts.session.is_none() && !ended => {
+            facts.session = Some(session.clone())
         }
-        Transition::Bound { registration_id } if facts.execution.state == State::Captured => {
-            facts.execution.state = State::Bound;
-            facts.execution.bound_registration_id = Some(registration_id.clone());
+        Transition::Attached { subject_id }
+            if facts.subject_id.is_none() && !facts.standing.is_terminal() =>
+        {
+            facts.subject_id = Some(subject_id.clone());
+        }
+        Transition::Reserved {
+            subject_id,
+            session,
+        } if !facts.standing.is_terminal() && !ended => {
+            facts.subject_id = Some(subject_id.clone());
+            facts.session = session.clone();
+            facts.standing = Standing::Reserved;
+        }
+        Transition::Presence { session }
+            if matches!(facts.standing, Standing::Reserved | Standing::Pending) && !ended =>
+        {
+            facts.session = Some(session.clone());
+            facts.standing = Standing::Pending;
+        }
+        Transition::Granted { subject_id }
+            if matches!(facts.standing, Standing::Reserved | Standing::Pending) && !ended =>
+        {
+            facts.subject_id = Some(subject_id.clone());
+            facts.standing = Standing::Granted;
+            facts.granted_at = Some(event.at.clone());
+        }
+        Transition::Duplicate { session } if !facts.standing.is_terminal() => {
+            facts.session = Some(session.clone());
+            facts.standing = Standing::Duplicate;
+        }
+        Transition::Released if !facts.standing.is_terminal() => {
+            facts.standing = Standing::Released;
+        }
+        _ => return Err("invalid lifecycle transition".into()),
+    }
+    Ok(facts)
+}
+
+/// Applies an execution transition. Everything about the process — identity,
+/// birth, binding, signal, exit, completion, placement — belongs here.
+fn reduce_process(previous: Option<&ProcessFacts>, event: &Event) -> Result<ProcessFacts, String> {
+    let mut facts = previous
+        .cloned()
+        .ok_or("lifecycle transition has no baseline")?;
+    match &event.transition {
+        Transition::Captured(process) if facts.state == State::Pending => {
+            facts.state = State::Captured;
+            facts.process = Some(process.clone());
+        }
+        Transition::Bound { registration_id } if facts.state == State::Captured => {
+            facts.state = State::Bound;
+            facts.bound_registration_id = Some(registration_id.clone());
         }
         Transition::Revoked
-            if matches!(
-                facts.execution.state,
-                State::Pending | State::Captured | State::Bound
-            ) =>
+            if matches!(facts.state, State::Pending | State::Captured | State::Bound) =>
         {
-            facts.execution.state = State::Revoked
+            facts.state = State::Revoked
         }
         Transition::SignalRequested
-            if facts.execution.process.is_some()
-                && facts.execution.signalled_at.is_none()
-                && facts.execution.exited_at.is_none() =>
+            if facts.process.is_some()
+                && facts.signalled_at.is_none()
+                && facts.exited_at.is_none() =>
         {
-            facts.execution.signalled_at = Some(event.at.clone())
+            facts.signalled_at = Some(event.at.clone())
         }
         Transition::Observed(observation)
-            if facts.execution.process.as_ref() == Some(&observation.process)
-                && facts.execution.exited_at.is_none() =>
+            if facts.process.as_ref() == Some(&observation.process)
+                && facts.exited_at.is_none() =>
         {
-            facts.execution.observation = Some(observation.clone());
+            facts.observation = Some(observation.clone());
         }
         // Placement is where an execution runs, so it is recorded while it is
         // there and never for one that has ended.
         Transition::Placed(placement)
-            if !matches!(facts.execution.state, State::Revoked)
-                && facts.execution.exited_at.is_none()
-                && facts.execution.ended_externally_at.is_none()
-                && facts.execution.completion.is_none() =>
+            if !matches!(facts.state, State::Revoked)
+                && facts.exited_at.is_none()
+                && facts.ended_externally_at.is_none()
+                && facts.completion.is_none() =>
         {
-            facts.execution.placement = Some(placement.clone())
+            facts.placement = Some(placement.clone())
         }
         Transition::AbsencePending(absence)
-            if facts.execution.exited_at.is_none()
-                && facts.execution.ended_externally_at.is_none() =>
+            if facts.exited_at.is_none() && facts.ended_externally_at.is_none() =>
         {
-            facts.execution.pane_absence = absence.clone();
+            facts.pane_absence = absence.clone();
         }
         Transition::EndedExternally(evidence)
-            if facts.execution.exited_at.is_none()
-                && facts.execution.ended_externally_at.is_none() =>
+            if facts.exited_at.is_none() && facts.ended_externally_at.is_none() =>
         {
-            facts.execution.ended_externally_at = Some(event.at.clone());
-            facts.execution.ended_evidence = Some(evidence.clone());
+            facts.ended_externally_at = Some(event.at.clone());
+            facts.ended_evidence = Some(evidence.clone());
             // The confirmed absence is the reason, so no window is left pending.
-            facts.execution.pane_absence = None;
+            facts.pane_absence = None;
         }
-        Transition::ExitVerified
-            if facts.execution.process.is_some() && facts.execution.exited_at.is_none() =>
-        {
-            facts.execution.exited_at = Some(event.at.clone())
+        Transition::ExitVerified if facts.process.is_some() && facts.exited_at.is_none() => {
+            facts.exited_at = Some(event.at.clone())
         }
         // A launch that ended leaves a pane nobody owns: one revoked before it
         // bound, or one bound and verifiably exited. Its cleanup outcome is
         // recorded once, so a later operation on the same launch reports it
         // rather than closing anything twice.
         Transition::Completed(completion)
-            if facts.execution.process.is_some() && facts.execution.completion.is_none() =>
+            if facts.process.is_some() && facts.completion.is_none() =>
         {
-            facts.execution.completion = Some(completion.clone())
+            facts.completion = Some(completion.clone())
         }
         Transition::PaneCleanup(outcome)
-            if facts.execution.pane_cleanup.is_none()
-                && (facts.execution.state == State::Revoked
-                    || facts.execution.exited_at.is_some()) =>
+            if facts.pane_cleanup.is_none()
+                && (facts.state == State::Revoked || facts.exited_at.is_some()) =>
         {
-            facts.execution.pane_cleanup = Some(outcome.clone())
-        }
-        Transition::SessionRecorded { session }
-            if facts.execution.state == State::Bound
-                && facts.attachment.session.is_none()
-                && facts.execution.exited_at.is_none()
-                && facts.execution.ended_externally_at.is_none() =>
-        {
-            facts.attachment.session = Some(session.clone())
-        }
-        Transition::Attached { subject_id }
-            if facts.attachment.subject_id.is_none()
-                && !facts.attachment.standing.is_terminal() =>
-        {
-            facts.attachment.subject_id = Some(subject_id.clone());
-        }
-        Transition::Reserved {
-            subject_id,
-            session,
-        } if !facts.attachment.standing.is_terminal()
-            && facts.execution.exited_at.is_none()
-            && facts.execution.ended_externally_at.is_none() =>
-        {
-            facts.attachment.subject_id = Some(subject_id.clone());
-            facts.attachment.session = session.clone();
-            facts.attachment.standing = Standing::Reserved;
-        }
-        Transition::Presence { session }
-            if matches!(
-                facts.attachment.standing,
-                Standing::Reserved | Standing::Pending
-            ) && facts.execution.exited_at.is_none() =>
-        {
-            facts.attachment.session = Some(session.clone());
-            facts.attachment.standing = Standing::Pending;
-        }
-        Transition::Granted { subject_id }
-            if matches!(
-                facts.attachment.standing,
-                Standing::Reserved | Standing::Pending
-            ) && facts.execution.exited_at.is_none()
-                && facts.execution.ended_externally_at.is_none() =>
-        {
-            facts.attachment.subject_id = Some(subject_id.clone());
-            facts.attachment.standing = Standing::Granted;
-            facts.attachment.granted_at = Some(event.at.clone());
-        }
-        Transition::Duplicate { session } if !facts.attachment.standing.is_terminal() => {
-            facts.attachment.session = Some(session.clone());
-            facts.attachment.standing = Standing::Duplicate;
-        }
-        Transition::Released if !facts.attachment.standing.is_terminal() => {
-            facts.attachment.standing = Standing::Released;
+            facts.pane_cleanup = Some(outcome.clone())
         }
         _ => return Err("invalid lifecycle transition".into()),
     }
-    facts.execution.recorded_at = event.at.clone();
+    facts.recorded_at = event.at.clone();
     Ok(facts)
 }
 

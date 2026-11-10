@@ -104,10 +104,12 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
             registration_id, ..
         }
         | Transition::Bound { registration_id } => Some(registration_id.clone()),
-        Transition::Enrolled(facts) => facts.execution.bound_registration_id.clone(),
+        Transition::Enrolled(facts) => log
+            .process(&facts.registration_id)
+            .and_then(|execution| execution.bound_registration_id.clone()),
         _ => facts
             .as_ref()
-            .map(|facts| facts.attachment.registration_id.clone())
+            .map(|facts| facts.registration_id.clone())
             .or_else(|| {
                 let id = event
                     .subject_id
@@ -120,13 +122,9 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
     let subject_id = if event.transition.is_container() {
         event.subject_id.clone()
     } else {
-        facts.as_ref().and_then(|facts| {
-            facts
-                .attachment
-                .subject_id
-                .as_ref()
-                .map(ToString::to_string)
-        })
+        facts
+            .as_ref()
+            .and_then(|facts| facts.subject_id.as_ref().map(ToString::to_string))
     };
     Some(Event {
         seq: 0,
@@ -143,8 +141,9 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         lifecycle_event_id: Some(event.event_id.clone()),
         registration_id,
         spawn: facts
-            .filter(|facts| facts.execution.origin == Origin::Spawned)
-            .map(|facts| facts.execution.spawn_request_id.clone())
+            .and_then(|facts| log.process(&facts.registration_id))
+            .filter(|execution| execution.origin == Origin::Spawned)
+            .map(|execution| execution.spawn_request_id.clone())
             .or_else(|| match &event.transition {
                 Transition::ProcessCreated { facts, .. } if facts.origin == Origin::Spawned => {
                     Some(facts.spawn_request_id.clone())
@@ -155,7 +154,9 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
             .operation_id
             .clone()
             .or_else(|| match &event.transition {
-                Transition::Enrolled(facts) => Some(facts.execution.spawn_request_id.clone()),
+                Transition::Enrolled(facts) => log
+                    .process(&facts.registration_id)
+                    .map(|execution| execution.spawn_request_id.clone()),
                 _ => None,
             }),
         at: event.at.clone(),

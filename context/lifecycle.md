@@ -339,11 +339,11 @@ A presence report carries the process and the session; the claim id it names is 
 **Type:** decision
 **Status:** active
 **Evidence:** confirmed
-**Source:** maintainer ruling that a registration exit or shutdown implicitly releases the claims it held, and that the "release if gone" case can never happen, 2026-11-10
-**Verification:** corroborated — `an_execution_that_ended_releases_the_claim_it_held` fails with the settlement disabled (the claim stays `Reserved` through the sweep) and passes with it
+**Source:** maintainer ruling that a registration exit or shutdown implicitly releases the claims it held, that authentication's supervisor is the primary exit signal, and that the "release if gone" case can never happen, 2026-11-10
+**Verification:** corroborated — `supervisor_completion_ends_the_execution_and_releases_its_claim` reads `Reserved` without the settlement and `Released` with it, and `an_execution_that_ended_releases_the_claim_it_held` fails with the exit settlement disabled
 **Revisit when:** an exit can only be observed after a claim is already needed by someone else, which would mean the observation cadence, not the model, is the problem
 
-`record_exit` and its locked twin are the only places an execution's end becomes a fact, and they are what every stop, close, pane death, launch withdrawal and sweep reach. Each releases the claims that execution still held. Presence admission reads who holds a session from recorded state and answers `duplicate` when someone does; it never inspects a holder's process and never releases on the caller's behalf.
+`record_exit_locked` is the one settlement: it establishes the end and releases the claims the execution still held. `record_exit` (the lock-taking recorder) and `record_completion` (the authenticated supervisor's report, which reaped the program it started) both delegate to it, so an exit and a completion end attachment authority the same way. Presence admission reads who holds a session from recorded state and answers `duplicate` when someone does; it never inspects a holder's process and never releases on the caller's behalf.
 
 **Reason:** a claim whose process had ended kept "holding" its session until the next process arrived and asked for it, so authority ended as a side effect of a request rather than as the consequence of the exit. That made the record wrong between the exit and the next claimant, and it put a process inspection in the middle of claim admission — the one place that should be a pure read of recorded state.
 
@@ -351,4 +351,38 @@ A presence report carries the process and the session; the claim id it names is 
 
 **Rejected alternative:** let `is_attached` decide by asking the process table whether the holder is alive. Rejected: reads would then reconstruct authority per query, which the same change removes elsewhere; observation belongs to the exit sweep and the pane-death wake.
 
-**Consequence:** the window this leaves is narrow, and two mechanisms already cover ordinary operation. A clean exit releases the claim first, because `session_shutdown` sends the release from a process that is still running and Pi awaits it. A managed launch is watched at hook latency: the daemon arms `remain-on-exit` on the pane before it respawns the program, so the program's exit leaves the pane behind rather than destroying it, and that is precisely what fires tmux's `pane-died` hook — `pane-exited` fires when the pane itself goes and is not used. The hook runs `lifecycle-wake`, which fences the server generation and observes the exit. What remains is a process that dies without ever owning a pane (an adopted agent in a shell pane that outlives it) or one killed too hard to run its shutdown; both wait for the sweep, and a process presenting on that session before then is answered `duplicate` and succeeds on retry.
+**Consequence:** both daemon-created and operator-run launches already use the same supervisor: its child enters the scope and becomes the program; its parent waits and reports code/signal through `launch.complete`. A dedicated pane retains the supervisor's final output through `remain-on-exit`; `pane-died` supplies an additional wake after the pane command ends. The wake checks the recorded program's process identity, so pane death alone is not proof of program exit. Ordered session shutdown normally releases the claim before either notification. If shutdown is missed, the supervisor's completion settles the execution and its claims on its own; a lost completion report leaves the wake and the sweep as fallbacks into that same settlement. Managed agent admission through `radar run --agent` is distinct from passive observation: unwrapped commands and TUIs remain observable without being granted managed lifecycle authority.
+
+## One creator records an execution; an attachment joins it
+
+**Id:** 3b7d1c4e-2a58-4f0b-9d3e-6c1a8f5b2e07
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Verification:** corroborated — `a_subject_admits_one_successor_at_a_time` fails with creation moved back ahead of the refusal (a refused reservation leaves an execution for the ceiling to withdraw) and passes with the check first; `attachment_views_share_process_evidence_across_replay` asserts the stale attachment still reads the recorded signal
+**Revisit when:** an execution needs facts at creation that only identification can supply, which would mean the split is in the wrong place rather than the order
+
+`ExecutionDraft::record` builds the record once, `create_execution` records it from its registration alone, and `identify_execution` records the verified process afterwards, storing the supervisor's key before the transition that depends on it. Adopted, admitted, configured, spawned and successor executions all reach the log through that one creator, and the three former entry points are compositions over it. A claim's first append joins the process facts the log already holds rather than restating them, so an attachment cannot disagree with the execution it names.
+
+**Reason:** three constructors each built a record and then mutated the parts that made them different — origin, kind, placement, key, intent — so what a new execution held depended on which caller ran, and only some of them validated before recording. Moving that into one record builder makes the fields a caller cannot know (correlation, scope, ordering) one decision, and makes "check, then record" the only order available.
+
+**Rejected alternative:** keep the per-entry-point record assembly and share only the final append. Rejected: it leaves three definitions of what a new execution is, which is what diverged in the first place.
+
+**Rejected alternative:** keep refusing a claim whose snapshot differs from the recorded facts. Rejected: it preserves a second copy as a thing that could be right, and the refusal fired on facts the attachment never owned (`bound_registration_id`), which is the wrong question to ask a join.
+
+## A claim owns who is attached; an execution owns what happened
+
+**Id:** 8f2e6a51-4c93-4d17-b0a8-1e5c7f3d9a24
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Verification:** corroborated — `a_claim_reads_its_execution_instead_of_carrying_a_copy` records a completion only on the execution and reads it through the claim; the event log's own `attachment_views_share_process_evidence_across_replay` now records process evidence on the execution stream and finds no execution facts on an attachment
+**Revisit when:** a consumer needs a point-in-time execution snapshot as it stood when an attachment was made, which is history the log already orders rather than state a claim should carry
+
+A claim's recorded facts are its registration, subject, managed metadata, session, standing and grant time. Identity, birth, binding, observation, placement, signal, exit, completion and pane cleanup are recorded on the execution's stream and read from there. `read_claim` composes the execution; the claim synchronisation that used to copy it (`sync_claim`) is gone, and `write_attempt` records execution changes on the execution stream rather than projecting a copy into the claim.
+
+**Reason:** one record had two copies of the same facts and a maintenance path between them, so a claim could disagree with the execution it named and a crash between the two writes left it that way. The copy also created work with no owner: the divergence check compared a claim's snapshot against the log and refused writes over facts the attachment never owned, such as a binding.
+
+**Rejected alternative:** keep the copy and synchronise it more carefully. Rejected: a second copy of a fact is a second answer to the same question, and the synchroniser had no consumer that could not read the execution directly.
+
+**Consequence:** a claim transition now validates itself against the execution rather than mutating it, so `Granted`, `Presence` and `Reserved` consult the execution record to refuse an ended one — the guard survives without the copy. Execution transitions validate their own preconditions, which is why `Placed`, `AbsencePending` and `EndedExternally` keep their original refusals.

@@ -233,7 +233,7 @@ pub struct SubjectRecord {
 /// not authority: an operation that would remove the pane compares
 /// `instance` against the backend serving now, and a placement recorded without
 /// one removes nothing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Placement {
     pub location: crate::control_plane::registry::RegistryLocation,
@@ -590,40 +590,116 @@ fn is_agent(kind: &ProcessKind) -> bool {
     *kind == ProcessKind::Agent
 }
 
-fn draft_process(
+/// What a caller knows when it records an execution, before anything runs.
+///
+/// Identification is not part of this: the verified process is recorded when it
+/// exists — immediately for adoption, when a launch presents for a launch.
+pub struct ExecutionDraft {
+    pub origin: Origin,
+    pub kind: ProcessKind,
+    pub placement: Option<Placement>,
+    pub intent: ManagedMetadata,
+}
+
+impl ExecutionDraft {
+    /// The record this draft describes, without recording anything.
+    fn record(
+        &self,
+        registration_id: RegistrationId,
+        spawn_request_id: String,
+        launch: LaunchContext,
+        now_ms: i64,
+    ) -> Result<ProcessRecord, String> {
+        self.intent.validate()?;
+        if let Some(placement) = &self.placement {
+            placement.validate()?;
+        }
+        let (scope, correlation) = match self.origin {
+            // A launch Radar starts is wrapped into a scope of its own, named from
+            // its registration. Membership is established again by `Scope::verify`
+            // before any stop or recovery acts on it.
+            Origin::Spawned | Origin::Admitted => (
+                crate::managed_scope::Scope::for_registration(registration_id.as_str()).ok(),
+                (self.origin == Origin::Spawned).then(random_uuid),
+            ),
+            Origin::Enrolled => (None, None),
+        };
+        Ok(ProcessRecord {
+            version: SUBJECT_VERSION,
+            scope,
+            registration_id,
+            spawn_request_id,
+            origin: self.origin,
+            kind: self.kind,
+            state: State::Pending,
+            launch,
+            correlation,
+            identity: None,
+            bound_registration_id: None,
+            observation: None,
+            pane_absence: None,
+            ended_externally_at: None,
+            ended_evidence: None,
+            signalled_at: None,
+            exited_at: None,
+            pane_cleanup: None,
+            completion: None,
+            completion_key: None,
+            placement: self.placement.clone(),
+            managed: self.intent.clone(),
+            recorded_at: format_millis(now_ms),
+        })
+    }
+}
+
+/// Records an execution from its registration alone.
+///
+/// Every execution Radar tracks is created here — adopted, admitted, configured,
+/// spawned, restart successor — so one place decides what a new execution holds.
+/// Nothing about the running process is known yet: identification records that,
+/// now for adoption or when a launch presents.
+pub fn create_execution(
+    registry: &Registry,
+    registration_id: RegistrationId,
     spawn_request_id: &str,
     launch: LaunchContext,
-    registration_id: RegistrationId,
+    draft: ExecutionDraft,
     now_ms: i64,
-) -> ProcessRecord {
-    ProcessRecord {
-        version: SUBJECT_VERSION,
-        // Every launch Radar starts is wrapped into a scope of its own, named from
-        // its registration. This records that intent; membership is established
-        // again by `Scope::verify` before any stop or recovery acts on it.
-        scope: crate::managed_scope::Scope::for_registration(registration_id.as_str()).ok(),
+) -> Result<ProcessRecord, String> {
+    let execution = draft.record(
         registration_id,
-        spawn_request_id: spawn_request_id.to_string(),
-        origin: Origin::Spawned,
-        kind: ProcessKind::Agent,
-        state: State::Pending,
+        spawn_request_id.to_string(),
         launch,
-        correlation: Some(random_uuid()),
-        identity: None,
-        bound_registration_id: None,
-        observation: None,
-        pane_absence: None,
-        ended_externally_at: None,
-        ended_evidence: None,
-        signalled_at: None,
-        exited_at: None,
-        pane_cleanup: None,
-        completion: None,
-        completion_key: None,
-        placement: None,
-        managed: ManagedMetadata::default(),
-        recorded_at: format_millis(now_ms),
-    }
+        now_ms,
+    )?;
+    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_process(registry, &mut log, &execution)?;
+    Ok(execution)
+}
+
+/// Records the verified process incarnation of an execution.
+///
+/// The supervisor's key is stored before the transition that depends on it, so a
+/// report can only be authenticated against a key the execution already holds.
+pub fn identify_execution(
+    registry: &Registry,
+    registration_id: &RegistrationId,
+    identity: &ProcessIdentity,
+    completion_key: Option<String>,
+    now_ms: i64,
+) -> Result<(), String> {
+    let _transition = registry.transition();
+    let mut execution = read_process(registry, registration_id)?
+        .ok_or_else(|| "the execution is not recorded".to_string())?;
+    execution.completion_key = completion_key;
+    store_recipe(registry, &execution)?;
+    record_process_transition(
+        registry,
+        registration_id,
+        crate::control_plane::events::Source::Launch,
+        crate::control_plane::events::Transition::Captured(identity.clone()),
+        now_ms,
+    )
 }
 
 /// What a caller establishes when it admits an execution in place: the process
@@ -644,29 +720,28 @@ pub fn create_process(
     admission: Admission,
     now_ms: i64,
 ) -> Result<ProcessRecord, String> {
-    check_bounds(&launch)?;
-    if let Some(placement) = &admission.placement {
-        placement.validate()?;
-    }
-    let mut process = draft_process(spawn_request_id, launch, RegistrationId::random(), now_ms);
-    process.kind = admission.kind;
-    process.completion_key = Some(admission.completion_key);
-    process.placement = admission.placement;
-    process.origin = Origin::Admitted;
-    process.correlation = None;
-    let _transition = registry.transition();
-    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    ensure_process(registry, &mut log, &process)?;
-    // Captured here so the first presence fences its bind on the verified identity.
-    log.append(
-        crate::control_plane::events::Stream::Process(&process.registration_id),
-        &format_millis(now_ms),
-        crate::control_plane::events::Source::Launch,
-        crate::control_plane::events::Transition::Captured(admission.identity.clone()),
+    let execution = create_execution(
+        registry,
+        RegistrationId::random(),
+        spawn_request_id,
+        launch,
+        ExecutionDraft {
+            origin: Origin::Admitted,
+            kind: admission.kind,
+            placement: admission.placement,
+            intent: ManagedMetadata::default(),
+        },
+        now_ms,
     )?;
-    process.state = State::Captured;
-    process.identity = Some(admission.identity);
-    Ok(process)
+    identify_execution(
+        registry,
+        &execution.registration_id,
+        &admission.identity,
+        Some(admission.completion_key),
+        now_ms,
+    )?;
+    read_process(registry, &execution.registration_id)?
+        .ok_or_else(|| "the admitted execution is not readable".to_string())
 }
 
 /// A captured managed agent binds by its execution identity, independently of spawn provenance.
@@ -713,9 +788,13 @@ pub fn spawn_exit(
 }
 
 /// Records how an admitted program ended, on the report of the supervisor that
-/// holds the key minted for it. The program is found by its captured identity, so
-/// a report names no registration; the key is what makes it that supervisor's.
-/// A second report for the same execution changes nothing.
+/// holds the key minted for it, and finalises that execution.
+///
+/// The program is found by its captured identity, so a report names no
+/// registration; the key is what makes it that supervisor's. The supervisor
+/// reaped the program it started, which establishes its end: the report records
+/// completion and settles exactly what a verified exit settles, without waiting
+/// for a pane notification or a sweep. A second report changes nothing.
 pub(crate) fn record_completion(
     registry: &Registry,
     process: &ProcessIdentity,
@@ -732,24 +811,26 @@ pub(crate) fn record_completion(
         .registration_of(process)
         .cloned()
         .ok_or("no launch holds this process")?;
-    let record = read_process(registry, &registration_id)?.ok_or("launch is not recorded")?;
+    let mut record = read_process(registry, &registration_id)?.ok_or("launch is not recorded")?;
     if record.completion_key.as_deref() != Some(key) {
         return Err("report does not come from this launch's supervisor".into());
     }
-    if record.completion.is_some() {
-        return Ok(());
-    }
-    record_process_transition(
-        registry,
-        &registration_id,
-        crate::control_plane::events::Source::Launch,
-        crate::control_plane::events::Transition::Completed(Completion {
+    if record.completion.is_none() {
+        let completion = Completion {
             code,
             signal,
             observed_at: format_millis(now_ms),
-        }),
-        now_ms,
-    )
+        };
+        record_process_transition(
+            registry,
+            &registration_id,
+            crate::control_plane::events::Source::Launch,
+            crate::control_plane::events::Transition::Completed(completion.clone()),
+            now_ms,
+        )?;
+        record.completion = Some(completion);
+    }
+    record_exit_locked(registry, &mut record, now_ms)
 }
 
 /// Binds a managed agent to its presented registration, fenced on the captured identity.
@@ -789,10 +870,14 @@ pub fn check_bounds_with_metadata(
     launch: &LaunchContext,
     managed: &ManagedMetadata,
 ) -> Result<(), String> {
-    managed.validate()?;
-    let mut draft = draft_process("", launch.clone(), RegistrationId::random(), 0);
-    draft.managed = managed.clone();
-    let bytes = serde_json::to_vec_pretty(&draft).map_err(|error| error.to_string())?;
+    let draft = ExecutionDraft {
+        origin: Origin::Spawned,
+        kind: ProcessKind::Agent,
+        placement: None,
+        intent: managed.clone(),
+    };
+    let record = draft.record(RegistrationId::random(), String::new(), launch.clone(), 0)?;
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_SUBJECT_BYTES {
         return Err("the launch is too large to track".into());
     }
@@ -859,8 +944,33 @@ pub fn create_with_intent(
 ) -> Result<Ticket, String> {
     managed.validate()?;
     let _transition = registry.transition();
-    let mut execution = draft_process(spawn_request_id, launch, RegistrationId::random(), now_ms);
-    execution.managed = managed.clone();
+    // A reservation that cannot be made records nothing: a refused successor must
+    // not leave an execution behind for the ceiling to withdraw.
+    if let Some((subject_id, expected)) = &successor {
+        if read_subject_record(registry, subject_id)?.is_none() {
+            return Err("subject is not recorded".into());
+        }
+        // A released subject has no granted claim, so its last grant is what a
+        // continuation succeeds.
+        if current_attachment(registry, subject_id)?.map(|claim| claim.claim_id)
+            != Some(expected.clone())
+        {
+            return Err("the subject's current claim changed; no launch was reserved".into());
+        }
+    }
+    let execution = create_execution(
+        registry,
+        RegistrationId::random(),
+        spawn_request_id,
+        launch,
+        ExecutionDraft {
+            origin: Origin::Spawned,
+            kind: ProcessKind::Agent,
+            placement: None,
+            intent: managed.clone(),
+        },
+        now_ms,
+    )?;
     let ticket = Ticket {
         registration_id: execution.registration_id.clone(),
         claim_id: None,
@@ -868,27 +978,11 @@ pub fn create_with_intent(
         launch_id: execution.spawn_request_id.clone(),
         correlation: execution.correlation.clone().unwrap_or_default(),
     };
-    let Some((subject_id, expected)) = successor else {
-        let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-        ensure_process(registry, &mut log, &execution)?;
+    let Some((subject_id, _expected)) = successor else {
         return Ok(ticket);
     };
-    if read_subject_record(registry, &subject_id)?.is_none() {
-        return Err("subject is not recorded".into());
-    }
-    // A released subject has no granted claim, so its last grant is what a
-    // continuation succeeds.
-    if current_attachment(registry, &subject_id)?.map(|claim| claim.claim_id)
-        != Some(expected.clone())
-    {
-        return Err("the subject's current claim changed; no launch was reserved".into());
-    }
     // The successor is an execution from the moment it is reserved: it is read,
     // cancelled and observed by its registration before anything presents on it.
-    {
-        let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-        ensure_process(registry, &mut log, &execution)?;
-    }
     let claim = Claim {
         claim_id: ClaimId::random(),
         subject_id,
@@ -925,21 +1019,16 @@ pub fn read_claim(registry: &Registry, claim_id: &ClaimId) -> Result<Option<Clai
     else {
         return Ok(None);
     };
-    let execution = load_process(
-        registry,
-        &facts.attachment.registration_id,
-        &facts.execution,
-    )?;
     let subject = Claim {
         claim_id: claim_id.clone(),
         subject_id: facts
-            .attachment
             .subject_id
             .clone()
             .ok_or("execution has no readable subject identity")?,
-        managed: facts.attachment.managed.clone(),
-        session: facts.attachment.session.clone(),
-        process: execution,
+        managed: facts.managed.clone(),
+        session: facts.session.clone(),
+        process: read_process(registry, &facts.registration_id)?
+            .ok_or("the attachment names no recorded execution")?,
     };
     Ok(Some(subject))
 }
@@ -1065,9 +1154,13 @@ pub fn reserved_claim(
         .map(|(claim, _)| claim))
 }
 
-/// Resolve a subject's current attachment: its newest claim that has not ended, or
-/// its last one when it is detached. A reservation is such an attachment while it
-/// waits to present, which is what lets a successor succeed its predecessor.
+/// Resolve a subject's current attachment: the claim that holds it now, else the
+/// newest claim that has not ended, else its last one when it is detached.
+///
+/// Holding wins over recency: a reserved successor waits beside the grant that
+/// still holds the subject, so it is not the subject's attachment until the
+/// incumbent's grant ends. With no grant — a launch in flight — the live attempt
+/// is what the subject currently attaches.
 pub fn current_attachment(
     registry: &Registry,
     subject_id: &SubjectId,
@@ -1076,16 +1169,21 @@ pub fn current_attachment(
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
         let mut last = None;
         let mut live = None;
+        let mut granted = None;
         for (claim, facts) in log.claims_of_subject(subject_id) {
             if last.is_none() {
                 last = Some(claim.clone());
             }
-            if !facts.standing.is_terminal() {
-                live = Some(claim);
-                break;
+            // A reservation excludes competitors without displacing the claim that
+            // holds the subject now, so the grant outranks a newer reservation.
+            if granted.is_none() && facts.standing.grants_authority() {
+                granted = Some(claim.clone());
+            }
+            if live.is_none() && !facts.standing.is_terminal() {
+                live = Some(claim.clone());
             }
         }
-        live.or(last)
+        granted.or(live).or(last)
     };
     match newest {
         Some(claim) => read_claim(registry, &claim),
@@ -1245,12 +1343,10 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
         record(registration_id, facts, None);
     }
     for id in log.ids() {
-        if let Some(facts) = log.facts(id) {
-            record(
-                &facts.attachment.registration_id,
-                &facts.execution,
-                facts.attachment.subject_id.as_ref(),
-            );
+        if let Some(facts) = log.facts(id)
+            && let Some(execution) = log.process(&facts.registration_id)
+        {
+            record(&facts.registration_id, execution, facts.subject_id.as_ref());
         }
     }
     placements.into_values().collect()
@@ -1325,7 +1421,7 @@ pub fn release_claim(registry: &Registry, claim_id: &ClaimId) -> Result<(), Stri
     let Some(facts) = facts else {
         return Ok(());
     };
-    if facts.attachment.standing.is_terminal() {
+    if facts.standing.is_terminal() {
         return Ok(());
     }
     append_claim(
@@ -1386,7 +1482,7 @@ pub fn record_claim_standing(
     use crate::control_plane::events::{Source, Transition};
     let recorded = {
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-        log.facts(&decision.claim_id).map(|facts| facts.attachment)
+        log.facts(&decision.claim_id)
     };
     let Some(recorded) = recorded else {
         return Err("claim is not recorded".into());
@@ -1444,17 +1540,14 @@ pub fn admit_claim(
     standing: crate::control_plane::events::Standing,
     now_ms: i64,
 ) -> Result<(), String> {
-    use crate::control_plane::events::{AttachmentFacts, Facts, ProcessFacts, Source, Transition};
-    let facts = Facts {
-        attachment: AttachmentFacts {
-            registration_id: execution.registration_id.clone(),
-            session: (!session.is_empty()).then(|| session.to_string()),
-            subject_id: None,
-            managed: execution.managed.clone(),
-            standing,
-            granted_at: None,
-        },
-        execution: ProcessFacts::from(&execution),
+    use crate::control_plane::events::{AttachmentFacts, Source, Transition};
+    let facts = AttachmentFacts {
+        registration_id: execution.registration_id.clone(),
+        session: (!session.is_empty()).then(|| session.to_string()),
+        subject_id: None,
+        managed: execution.managed.clone(),
+        standing,
+        granted_at: None,
     };
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
     ensure_process(registry, &mut log, &execution)?;
@@ -1462,7 +1555,7 @@ pub fn admit_claim(
         crate::control_plane::events::Stream::Claim(claim_id),
         &format_millis(now_ms),
         Source::Registration,
-        Transition::Created(facts),
+        Transition::Created(Box::new(facts)),
     )
 }
 
@@ -1494,7 +1587,9 @@ pub fn adopted_execution(
     if let Some(process) = read_process(registry, registration_id)? {
         return Ok(process);
     }
-    let mut adopted = draft_process(
+    create_execution(
+        registry,
+        registration_id.clone(),
         registration_id.as_str(),
         LaunchContext {
             executable: String::new(),
@@ -1502,14 +1597,14 @@ pub fn adopted_execution(
             cwd: None,
             env: Default::default(),
         },
-        registration_id.clone(),
+        ExecutionDraft {
+            origin: Origin::Enrolled,
+            kind: ProcessKind::Agent,
+            placement: None,
+            intent: ManagedMetadata::default(),
+        },
         now_ms,
-    );
-    adopted.origin = Origin::Enrolled;
-    adopted.scope = None;
-    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    ensure_process(registry, &mut log, &adopted)?;
-    Ok(adopted)
+    )
 }
 
 fn subject_record_path(registry: &Registry, subject_id: &str) -> PathBuf {
@@ -1615,7 +1710,6 @@ pub fn record_pane_cleanup(
         crate::control_plane::events::Transition::PaneCleanup(outcome.clone()),
         now_ms,
     )?;
-    sync_claim(registry, registration_id)?;
     Ok(outcome)
 }
 
@@ -1657,7 +1751,7 @@ pub fn capture(
         crate::control_plane::events::Transition::Captured(process.clone()),
         now_ms,
     )?;
-    sync_claim(registry, registration_id)
+    Ok(())
 }
 
 /// Decides whether a registration may bind the tracked launch, and records the
@@ -1701,7 +1795,7 @@ pub(crate) fn fence_registration(
                 },
                 now_ms,
             )?;
-            sync_claim(registry, registration_id)
+            Ok(())
         }
         State::Captured => Err("registration does not match the launched process".into()),
         State::Pending => Err("launch has not been released to its process".into()),
@@ -2000,6 +2094,22 @@ pub fn enroll_subject(
     {
         return Err("the registration's process birth identity changed".into());
     }
+    // A reattachment continues the session's subject, so its children, inbox and
+    // managed metadata continue with it. A launch that named its own intent — the
+    // parent it was spawned for, its owner and run — says what this attachment is
+    // for now, so the execution's metadata wins when it carries any.
+    let continuing = subject_record_for_session(registry, session)?;
+    // A reservation for this session's own subject that names another execution is
+    // a restart or continuation that will not arrive: the session came back on a
+    // different process. Settle it before judging the attachment, so it neither
+    // holds the subject until its deadline nor blocks the session that returned.
+    if let Some(record) = &continuing
+        && let Some(reserved) = reserved_claim(registry, &record.subject_id)?
+        && read_claim(registry, &reserved)?
+            .is_some_and(|claim| &claim.process.registration_id != registration_id)
+    {
+        release_claim(registry, &reserved)?;
+    }
     match attachment(registry, registration_id, session, now_ms)? {
         Attachment::Other(_) => {
             return Err("the session is already attached to another live process".into());
@@ -2007,11 +2117,7 @@ pub fn enroll_subject(
         Attachment::Own(own) if &own.claim_id == enrollment_id => return Ok(own.claim_id),
         Attachment::Own(_) | Attachment::Free => {}
     }
-    // A reattachment continues the session's subject, so its children, inbox and
-    // managed metadata continue with it. A launch that named its own intent — the
-    // parent it was spawned for, its owner and run — says what this attachment is
-    // for now, so the execution's metadata wins when it carries any.
-    let (logical, continued) = match subject_record_for_session(registry, session)? {
+    let (logical, continued) = match continuing {
         Some(record) => (Some(record.subject_id), record.managed),
         None => (None, ManagedMetadata::default()),
     };
@@ -2025,17 +2131,22 @@ pub fn enroll_subject(
     let unidentified_launch = execution
         .as_ref()
         .is_none_or(|execution| execution.launch.executable.is_empty());
-    let execution = execution.unwrap_or_else(|| {
-        let mut adopted = draft_process(
+    let execution = match execution {
+        Some(execution) => execution,
+        None => create_execution(
+            registry,
+            registration_id.clone(),
             enrollment_id.as_str(),
             launch.clone(),
-            registration_id.clone(),
+            ExecutionDraft {
+                origin: Origin::Enrolled,
+                kind: ProcessKind::Agent,
+                placement: None,
+                intent: ManagedMetadata::default(),
+            },
             now_ms,
-        );
-        adopted.origin = Origin::Enrolled;
-        adopted.scope = None;
-        adopted
-    });
+        )?,
+    };
     let mut subject = Claim {
         claim_id: enrollment_id.clone(),
         subject_id: logical,
@@ -2199,7 +2310,7 @@ fn released(registry: &Registry, claim_id: &ClaimId) -> Result<bool, String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .facts(claim_id)
-        .is_some_and(|facts| facts.attachment.standing.is_terminal()))
+        .is_some_and(|facts| facts.standing.is_terminal()))
 }
 
 /// One claim, under the presence lock both withdrawal paths hold.
@@ -2576,7 +2687,7 @@ pub fn list_after(
             .filter(|id| after.is_none_or(|after| id.as_str() > after))
             .filter(|id| {
                 log.facts(id)
-                    .is_some_and(|facts| facts.attachment.subject_id.is_some())
+                    .is_some_and(|facts| facts.subject_id.is_some())
             })
             .map(ToString::to_string)
             .collect()
@@ -2643,7 +2754,7 @@ pub fn sweep(
 /// Marks a launch cancelled, so nothing it reserved can be captured afterwards.
 ///
 /// The revocation is recorded on the execution, which is what refuses a later
-/// capture; the claim projection it may have follows through [`sync_claim`].
+/// capture; any claim it held reads the execution rather than a copy of it.
 fn revoke_execution(
     registry: &Registry,
     registration_id: &RegistrationId,
@@ -2946,7 +3057,6 @@ fn stage(
             crate::control_plane::events::Transition::SignalRequested,
             now_ms,
         )?;
-        sync_claim(registry, &current.registration_id)?;
     }
     Ok(Stage::Watch {
         descriptor,
@@ -3135,39 +3245,6 @@ fn record_exit_of_registration(
     record_exit(registry, &process, now_ms)
 }
 
-/// Writes an execution's facts to the claim that holds it, when one does.
-///
-/// An execution is recorded whether or not a session attached it, so its own
-/// stream is the record; a claim that holds it carries a copy as of its last
-/// sync, which is what the claim-keyed reads and requests see.
-pub(crate) fn sync_claim(
-    registry: &Registry,
-    registration_id: &RegistrationId,
-) -> Result<(), String> {
-    let Some(execution) = read_process(registry, registration_id)? else {
-        return Ok(());
-    };
-    let Some(decision) =
-        crate::control_plane::registry::presence::current(registry, registration_id)?
-            .filter(|decision| decision.subject_id.is_some())
-    else {
-        return Ok(());
-    };
-    let Ok(Some(existing)) = read_claim(registry, &decision.claim_id) else {
-        return Ok(());
-    };
-    if existing.process == execution {
-        return Ok(());
-    }
-    write(
-        registry,
-        &Claim {
-            process: execution,
-            ..existing
-        },
-    )
-}
-
 /// The execution one process incarnation is, without needing its attempt.
 fn process_of_registration(
     registry: &Registry,
@@ -3199,29 +3276,9 @@ fn record_exit(registry: &Registry, process: &ProcessRecord, now_ms: i64) -> Res
     let _transition = registry.transition();
     // Another observer may have recorded the exit since this record was read, and
     // a second `ExitVerified` is an invalid transition rather than a no-op.
-    let recorded = if process.exited_at.is_some() {
-        true
-    } else {
-        read_process(registry, &process.registration_id)?
-            .is_some_and(|current| current.exited_at.is_some())
-    };
-    if !recorded {
-        record_process_transition(
-            registry,
-            &process.registration_id,
-            crate::control_plane::events::Source::ProcessControl,
-            crate::control_plane::events::Transition::ExitVerified,
-            now_ms,
-        )?;
-    }
-    // An execution that has ended holds nothing: the claims it held end with it.
-    // Every way an exit is established — a stop, a close, a pane death, a launch
-    // withdrawal, the sweeper — arrives here, so attachment authority ends in one
-    // transition rather than being inferred later from a liveness check.
-    for claim in live_claims_of(registry, &process.registration_id) {
-        release_claim(registry, &claim)?;
-    }
-    Ok(())
+    let mut current =
+        read_process(registry, &process.registration_id)?.unwrap_or_else(|| process.clone());
+    record_exit_locked(registry, &mut current, now_ms)
 }
 
 /// The claims an execution still holds, in recorded order.
@@ -3670,22 +3727,26 @@ fn ensure_process(
         },
         crate::control_plane::events::Transition::ProcessCreated {
             registration_id: process.registration_id.clone(),
-            facts: crate::control_plane::events::ProcessFacts::from(process),
+            facts: Box::new(crate::control_plane::events::ProcessFacts::from(process)),
         },
     )
 }
 
 fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
-    use crate::control_plane::events::{Facts, Source, Stream, Transition};
+    use crate::control_plane::events::{AttachmentFacts, ProcessFacts, Source, Stream, Transition};
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
     ensure_process(registry, &mut log, &subject.process)?;
+    // Execution facts are recorded on the execution's stream; this writer only
+    // projects what the caller changed, and every transition validates itself
+    // against the record it extends.
+    let recorded_execution = ProcessFacts::from(&subject.process);
     let mut previous = match log.facts(&subject.claim_id) {
         Some(facts) => facts,
         None => {
-            let facts = Facts::from_subject(subject);
+            let facts = AttachmentFacts::of(subject);
             let (source, transition) = match subject.process.origin {
-                Origin::Spawned => (Source::Launch, Transition::Created(facts)),
-                Origin::Enrolled => (Source::Registration, Transition::Enrolled(facts)),
+                Origin::Spawned => (Source::Launch, Transition::Created(Box::new(facts))),
+                Origin::Enrolled => (Source::Registration, Transition::Enrolled(Box::new(facts))),
                 Origin::Admitted => return Err("an admitted process has no subject".into()),
             };
             return log.append(
@@ -3696,15 +3757,15 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
             );
         }
     };
-    let mut target = Facts::from_subject(subject);
+    let mut target = AttachmentFacts::of(subject);
     // Writing facts never rewrites standing: grant, reservation and release are
     // their own recorded transitions.
-    target.attachment.standing = previous.attachment.standing;
-    target.attachment.granted_at = previous.attachment.granted_at.clone();
+    target.standing = previous.standing;
+    target.granted_at = previous.granted_at.clone();
     // A subject learned later is recorded on the claim itself: an attachment
     // attempt starts before its durable subject is resolved.
-    if previous.attachment.subject_id.is_none()
-        && let Some(subject_id) = target.attachment.subject_id.clone()
+    if previous.subject_id.is_none()
+        && let Some(subject_id) = target.subject_id.clone()
     {
         log.append(
             crate::control_plane::events::Stream::Claim(&subject.claim_id),
@@ -3716,127 +3777,132 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
             .facts(&subject.claim_id)
             .ok_or("the claim disappeared while recording its subject")?;
     }
-    if previous == target {
+    let previous_execution = log
+        .process(&subject.process.registration_id)
+        .cloned()
+        .ok_or("the execution is not recorded")?;
+    let execution_changed = previous_execution != recorded_execution;
+    if previous == target && !execution_changed {
         return Ok(());
     }
-    let (source, transition) = if previous.execution.state != target.execution.state {
-        match target.execution.state {
-            State::Captured => (
-                Source::Bootstrap,
-                Transition::Captured(
-                    target
-                        .execution
-                        .process
-                        .clone()
-                        .ok_or("capture has no process")?,
+    if execution_changed {
+        let (source, transition) = if previous_execution.state != recorded_execution.state {
+            match recorded_execution.state {
+                State::Captured => (
+                    Source::Bootstrap,
+                    Transition::Captured(
+                        recorded_execution
+                            .process
+                            .clone()
+                            .ok_or("capture has no process")?,
+                    ),
                 ),
-            ),
-            State::Bound => (
-                Source::Registration,
-                Transition::Bound {
-                    registration_id: target
-                        .execution
-                        .bound_registration_id
+                State::Bound => (
+                    Source::Registration,
+                    Transition::Bound {
+                        registration_id: recorded_execution
+                            .bound_registration_id
+                            .clone()
+                            .ok_or("binding has no agent")?,
+                    },
+                ),
+                State::Revoked => (Source::ProcessControl, Transition::Revoked),
+                State::Pending => return Err("cannot return a subject to pending".into()),
+            }
+        } else if previous_execution.observation != recorded_execution.observation {
+            (
+                Source::ProcessObservation,
+                Transition::Observed(
+                    recorded_execution
+                        .observation
                         .clone()
-                        .ok_or("binding has no agent")?,
-                },
-            ),
-            State::Revoked => (Source::ProcessControl, Transition::Revoked),
-            State::Pending => return Err("cannot return a subject to pending".into()),
+                        .ok_or("cannot remove a process observation")?,
+                ),
+            )
+        } else if previous_execution.exited_at != recorded_execution.exited_at {
+            (Source::ProcessObservation, Transition::ExitVerified)
+        } else if previous_execution.completion != recorded_execution.completion {
+            (
+                Source::Launch,
+                Transition::Completed(
+                    recorded_execution
+                        .completion
+                        .clone()
+                        .ok_or("cannot remove a completion")?,
+                ),
+            )
+        } else if previous_execution.pane_cleanup != recorded_execution.pane_cleanup {
+            (
+                Source::PaneControl,
+                Transition::PaneCleanup(
+                    recorded_execution
+                        .pane_cleanup
+                        .clone()
+                        .ok_or("cannot remove a pane cleanup outcome")?,
+                ),
+            )
+        } else if previous_execution.signalled_at != recorded_execution.signalled_at {
+            (Source::ProcessControl, Transition::SignalRequested)
+        } else if previous_execution.ended_externally_at != recorded_execution.ended_externally_at {
+            (
+                Source::ProcessObservation,
+                Transition::EndedExternally(
+                    recorded_execution
+                        .ended_evidence
+                        .clone()
+                        .ok_or("an ended-externally outcome needs its evidence")?,
+                ),
+            )
+        } else if previous_execution.pane_absence != recorded_execution.pane_absence {
+            (
+                Source::ProcessObservation,
+                Transition::AbsencePending(recorded_execution.pane_absence.clone()),
+            )
+        } else {
+            return Err("unsupported lifecycle transition".into());
+        };
+        // A presented process is captured before it binds: enrollment verifies the
+        // identity, so the execution records that identification rather than
+        // jumping from pending straight to bound.
+        if recorded_execution.state == State::Bound
+            && previous_execution.state != State::Captured
+            && previous_execution.state != State::Bound
+        {
+            let identity = recorded_execution
+                .process
+                .clone()
+                .ok_or("binding has no captured process")?;
+            log.append(
+                crate::control_plane::events::Stream::Process(&subject.process.registration_id),
+                &subject.process.recorded_at,
+                Source::Bootstrap,
+                Transition::Captured(identity),
+            )?;
         }
-    } else if previous.execution.observation != target.execution.observation {
-        (
-            Source::ProcessObservation,
-            Transition::Observed(
-                target
-                    .execution
-                    .observation
-                    .clone()
-                    .ok_or("cannot remove a process observation")?,
-            ),
-        )
-    } else if previous.execution.exited_at != target.execution.exited_at {
-        (Source::ProcessObservation, Transition::ExitVerified)
-    } else if previous.execution.completion != target.execution.completion {
-        (
-            Source::Launch,
-            Transition::Completed(
-                target
-                    .execution
-                    .completion
-                    .clone()
-                    .ok_or("cannot remove a completion")?,
-            ),
-        )
-    } else if previous.execution.pane_cleanup != target.execution.pane_cleanup {
-        (
-            Source::PaneControl,
-            Transition::PaneCleanup(
-                target
-                    .execution
-                    .pane_cleanup
-                    .clone()
-                    .ok_or("cannot remove a pane cleanup outcome")?,
-            ),
-        )
-    } else if previous.execution.signalled_at != target.execution.signalled_at {
-        (Source::ProcessControl, Transition::SignalRequested)
-    } else if previous.execution.ended_externally_at != target.execution.ended_externally_at {
-        (
-            Source::ProcessObservation,
-            Transition::EndedExternally(
-                target
-                    .execution
-                    .ended_evidence
-                    .clone()
-                    .ok_or("an ended-externally outcome needs its evidence")?,
-            ),
-        )
-    } else if previous.execution.pane_absence != target.execution.pane_absence {
-        (
-            Source::ProcessObservation,
-            Transition::AbsencePending(target.execution.pane_absence.clone()),
-        )
-    } else if previous.attachment.session.is_none() && target.attachment.session.is_some() {
-        (
-            Source::Registration,
-            Transition::SessionRecorded {
-                session: target
-                    .attachment
-                    .session
-                    .clone()
-                    .ok_or("a recorded session is named")?,
-            },
-        )
-    } else {
-        return Err("unsupported lifecycle transition".into());
-    };
-    // A presented process is captured before it binds: enrollment verifies the
-    // identity, so the claim's own stream records that identification rather than
-    // jumping from pending straight to bound.
-    if previous.execution.state != target.execution.state
-        && target.execution.state == State::Bound
-        && previous.execution.state != State::Captured
-    {
-        let identity = target
-            .execution
-            .process
-            .clone()
-            .ok_or("binding has no captured process")?;
         log.append(
-            crate::control_plane::events::Stream::Claim(&subject.claim_id),
+            crate::control_plane::events::Stream::Process(&subject.process.registration_id),
             &subject.process.recorded_at,
-            Source::Bootstrap,
-            Transition::Captured(identity),
+            source,
+            transition,
         )?;
+        return Ok(());
     }
-    log.append_checked(
-        &subject.claim_id,
-        &subject.process.recorded_at,
-        source,
-        transition,
-        &target,
-    )
+    if previous.session.is_none() && target.session.is_some() {
+        let transition = Transition::SessionRecorded {
+            session: target
+                .session
+                .clone()
+                .ok_or("a recorded session is named")?,
+        };
+        return log.append_checked(
+            &subject.claim_id,
+            &subject.process.recorded_at,
+            Source::Registration,
+            transition,
+            &target,
+        );
+    }
+    Err("unsupported lifecycle transition".into())
 }
 
 fn recipe_path(registry: &Registry, subject_id: &str) -> PathBuf {
@@ -4093,6 +4159,238 @@ mod tests {
     }
 
     #[test]
+    fn a_reservation_that_can_never_arrive_is_settled_when_the_session_returns() {
+        let scratch = Scratch::new("reservation-mismatch");
+        let registry = scratch.registry();
+        let session = random_uuid();
+        let first = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            None,
+            ManagedMetadata::default(),
+            1,
+        )
+        .expect("first execution")
+        .registration_id;
+        let claim = enroll_subject(
+            &registry,
+            &ClaimId::random(),
+            &first,
+            &ProcessIdentity {
+                pid: 41,
+                boot_id: "test-boot".into(),
+                start_ticks: 1,
+            },
+            &session,
+            launch(),
+            2,
+        )
+        .expect("the session presents");
+        let subject = read_claim(&registry, &claim)
+            .expect("read")
+            .expect("claim")
+            .subject_id;
+        release_claim(&registry, &claim).expect("the attachment ends");
+
+        // A restart reserves a successor for the subject, and that successor never
+        // arrives: the operator resumed the session on another process instead.
+        let successor = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((subject.clone(), claim.clone())),
+            ManagedMetadata::default(),
+            3,
+        )
+        .expect("a successor is reserved");
+        assert!(
+            reserved_claim(&registry, &subject)
+                .expect("reservation")
+                .is_some(),
+            "the reservation stands before the session returns"
+        );
+        let elsewhere = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            None,
+            ManagedMetadata::default(),
+            4,
+        )
+        .expect("a second execution")
+        .registration_id;
+        let attached = enroll_subject(
+            &registry,
+            &ClaimId::random(),
+            &elsewhere,
+            &ProcessIdentity {
+                pid: 42,
+                boot_id: "test-boot".into(),
+                start_ticks: 2,
+            },
+            &session,
+            launch(),
+            5,
+        )
+        .expect("the session returns on a different process");
+
+        assert_eq!(
+            read_claim(&registry, &attached)
+                .expect("read")
+                .expect("claim")
+                .subject_id,
+            subject,
+            "the presented session continues its own subject"
+        );
+        assert_eq!(
+            reserved_claim(&registry, &subject).expect("reservation"),
+            None,
+            "a reservation that can never arrive no longer holds the subject"
+        );
+        assert_eq!(
+            crate::control_plane::registry::presence::decision(
+                &registry,
+                successor.claim_id.as_ref().expect("a reserved claim")
+            )
+            .expect("decision")
+            .expect("claim")
+            .standing,
+            crate::control_plane::registry::presence::Standing::Released,
+            "the intended restart is settled rather than left pending"
+        );
+    }
+
+    #[test]
+    fn publication_cost_is_measured_before_any_of_it_is_optimised() {
+        use std::time::Instant;
+        let scratch = Scratch::new("publication-cost");
+        let registry = scratch.registry();
+        let mut samples = Vec::new();
+        for size in [1usize, 25, 100] {
+            while samples.len() < size {
+                let session = format!("session-{}", samples.len());
+                let registration = create_with_intent(
+                    &registry,
+                    &random_uuid(),
+                    launch(),
+                    None,
+                    None,
+                    ManagedMetadata::default(),
+                    samples.len() as i64 + 1,
+                )
+                .expect("an execution")
+                .registration_id;
+                enroll_subject(
+                    &registry,
+                    &ClaimId::random(),
+                    &registration,
+                    &ProcessIdentity {
+                        pid: 100 + samples.len() as i32,
+                        boot_id: "test-boot".into(),
+                        start_ticks: samples.len() as u64 + 1,
+                    },
+                    &session,
+                    launch(),
+                    samples.len() as i64 + 2,
+                )
+                .expect("an attachment");
+                samples.push(registration);
+            }
+            let started = Instant::now();
+            let read = crate::control_plane::registry_read::read(&registry, None, 1_000)
+                .expect("publication");
+            let elapsed = started.elapsed();
+            println!(
+                "publication: {size} subjects, {} executions, {} lifecycle entries in {elapsed:?}",
+                read.agents.len(),
+                read.lifecycle.len()
+            );
+            assert_eq!(read.lifecycle.len(), size, "every subject is published");
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "a publication of {size} subjects took {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_that_names_no_intent_continues_the_session_s_metadata() {
+        let scratch = Scratch::new("intent-precedence");
+        let registry = scratch.registry();
+        let session = random_uuid();
+        let described = ManagedMetadata {
+            owner: Some("herdsman".into()),
+            run: Some("run-3".into()),
+            label: Some("reviewer".into()),
+            ..ManagedMetadata::default()
+        };
+        let launching = |intent: ManagedMetadata, at: i64| {
+            create_with_intent(&registry, &random_uuid(), launch(), None, None, intent, at)
+                .expect("a launch records its intent")
+                .registration_id
+        };
+        let enrolling = |registration: &RegistrationId, pid: i32, at: i64| {
+            enroll_subject(
+                &registry,
+                &ClaimId::random(),
+                registration,
+                &ProcessIdentity {
+                    pid,
+                    boot_id: "test-boot".into(),
+                    start_ticks: pid as u64,
+                },
+                &session,
+                launch(),
+                at,
+            )
+            .expect("the session presents")
+        };
+
+        let first = enrolling(&launching(described.clone(), 1), 41, 2);
+        let subject = read_claim(&registry, &first)
+            .expect("read")
+            .expect("claim")
+            .subject_id;
+        // The process that named the intent ends, as it does before a session
+        // comes back on another execution.
+        release_claim(&registry, &first).expect("the first attachment ends");
+
+        // The same session returns on an execution that names no intent: what the
+        // session is outlives the process that said so.
+        let second = enrolling(&launching(ManagedMetadata::default(), 3), 42, 4);
+        let continued = read_claim(&registry, &second)
+            .expect("read")
+            .expect("claim");
+        assert_eq!(
+            continued.subject_id, subject,
+            "the session continues its subject"
+        );
+        assert_eq!(
+            continued.managed, described,
+            "absent intent retains what the session already is"
+        );
+
+        // Explicit intent says what this launch is for now, so it wins.
+        let restated = ManagedMetadata {
+            owner: Some("operator".into()),
+            label: Some("critic".into()),
+            ..ManagedMetadata::default()
+        };
+        release_claim(&registry, &second).expect("the continued attachment ends");
+        let third = enrolling(&launching(restated.clone(), 5), 43, 6);
+        let replaced = read_claim(&registry, &third).expect("read").expect("claim");
+        assert_eq!(replaced.subject_id, subject);
+        assert_eq!(
+            replaced.managed, restated,
+            "named intent wins over the session's continued metadata"
+        );
+    }
+
+    #[test]
     fn a_reserved_session_is_held_by_its_own_process_and_by_no_other() {
         let scratch = Scratch::new("reserved-holder");
         let registry = scratch.registry();
@@ -4234,6 +4532,135 @@ mod tests {
         assert!(
             refusal.contains(process.registration_id.as_str()),
             "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_claim_reads_its_execution_instead_of_carrying_a_copy() {
+        let scratch = Scratch::new("claim-reads-execution");
+        let registry = scratch.registry();
+        let (claim_id, mut child, identity) = captured_child(&registry);
+        let key = read_claim(&registry, &claim_id)
+            .expect("read")
+            .expect("claim")
+            .process
+            .completion_key
+            .clone()
+            .expect("the supervisor's key");
+        child.0.kill().expect("kill");
+        child.0.wait().expect("wait");
+
+        // Nothing writes the claim here: what it reports comes from the execution.
+        record_completion(&registry, &identity, &key, Some(5), None, 3).expect("completion");
+
+        let claim = read_claim(&registry, &claim_id)
+            .expect("read")
+            .expect("claim");
+        assert!(
+            claim.process.exited_at.is_some(),
+            "the claim reports the end its execution recorded"
+        );
+        assert_eq!(
+            claim.process.completion.map(|done| done.code),
+            Some(Some(5))
+        );
+    }
+
+    #[test]
+    fn supervisor_completion_ends_the_execution_and_releases_its_claim() {
+        let scratch = Scratch::new("completion-finalises");
+        let registry = scratch.registry();
+        let (claim_id, mut child, identity) = captured_child(&registry);
+        let claim = read_claim(&registry, &claim_id)
+            .expect("read")
+            .expect("claim");
+        let registration = claim.process.registration_id.clone();
+        let key = claim
+            .process
+            .completion_key
+            .clone()
+            .expect("the supervisor's key");
+        child.0.kill().expect("kill");
+        child.0.wait().expect("wait");
+
+        record_completion(&registry, &identity, &key, Some(7), None, 3).expect("completion");
+
+        // No sweep, no pane notification: the supervisor reaped the program, so its
+        // report is the end of the execution and the end of what it held.
+        assert_eq!(
+            crate::control_plane::registry::presence::decision(&registry, &claim_id)
+                .expect("decision")
+                .expect("claim")
+                .standing,
+            crate::control_plane::registry::presence::Standing::Released,
+            "a completed execution holds no claim"
+        );
+        let execution = read_process(&registry, &registration)
+            .expect("read")
+            .expect("execution");
+        assert!(
+            execution.exited_at.is_some(),
+            "the execution reads as ended"
+        );
+        assert_eq!(
+            execution.completion.map(|completion| completion.code),
+            Some(Some(7))
+        );
+
+        record_completion(&registry, &identity, &key, None, Some(9), 4).expect("replay");
+        let after = read_process(&registry, &registration)
+            .expect("read")
+            .expect("execution");
+        assert_eq!(
+            after
+                .completion
+                .map(|completion| (completion.code, completion.signal)),
+            Some((Some(7), None)),
+            "a second report changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_completion_after_a_verified_exit_records_the_status_it_carries() {
+        let scratch = Scratch::new("completion-after-exit");
+        let registry = scratch.registry();
+        let (claim_id, mut child, identity) = captured_child(&registry);
+        let claim = read_claim(&registry, &claim_id)
+            .expect("read")
+            .expect("claim");
+        let registration = claim.process.registration_id.clone();
+        let execution = read_process(&registry, &registration)
+            .expect("read")
+            .expect("execution");
+        let key = execution
+            .completion_key
+            .clone()
+            .expect("the supervisor's key");
+        child.0.kill().expect("kill");
+        child.0.wait().expect("wait");
+
+        record_exit(&registry, &execution, 3).expect("verified exit");
+        let ended = read_process(&registry, &registration)
+            .expect("read")
+            .expect("execution")
+            .exited_at;
+        record_completion(&registry, &identity, &key, Some(3), None, 4).expect("completion");
+
+        let after = read_process(&registry, &registration)
+            .expect("read")
+            .expect("execution");
+        assert_eq!(after.exited_at, ended, "the established end is unchanged");
+        assert_eq!(
+            after.completion.map(|completion| completion.code),
+            Some(Some(3)),
+            "the status the fallback could not observe is still recorded"
+        );
+        assert_eq!(
+            crate::control_plane::registry::presence::decision(&registry, &claim_id)
+                .expect("decision")
+                .expect("claim")
+                .standing,
+            crate::control_plane::registry::presence::Standing::Released
         );
     }
 
@@ -4657,6 +5084,7 @@ mod tests {
             2,
         )
         .expect("successor reserves the predecessor");
+        let before = registry.events.lock().unwrap().processes().count();
         assert!(
             create_with_intent(
                 &registry,
@@ -4671,9 +5099,66 @@ mod tests {
             "a rival launch must not pre-mint a second successor"
         );
         assert_eq!(
+            registry.events.lock().unwrap().processes().count(),
+            before,
+            "a refused reservation records no execution for the ceiling to withdraw"
+        );
+        assert_eq!(
             reserved_claim(&registry, &subject_id).expect("reservation"),
             reserved.claim_id.clone(),
             "the first successor still holds the subject"
+        );
+    }
+
+    #[test]
+    fn a_reserved_successor_does_not_become_the_subject_s_attachment() {
+        let scratch = Scratch::new("reservation-not-current");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("incumbent");
+        let incumbent = first.claim_id.clone().expect("a claim");
+        let subject_id = first.subject_id.clone().expect("a subject");
+        // A subject whose attachment holds authority: the state a restart begins
+        // from, and the one a reservation must not displace.
+        append_claim(
+            &registry,
+            &incumbent,
+            "2026-01-01T00:00:01.000Z",
+            crate::control_plane::events::Source::Registration,
+            crate::control_plane::events::Transition::Granted {
+                subject_id: subject_id.clone(),
+            },
+        )
+        .expect("grant");
+        let reserved = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((subject_id.clone(), incumbent.clone())),
+            ManagedMetadata::default(),
+            2,
+        )
+        .expect("successor reserves the predecessor")
+        .claim_id
+        .expect("a reserved claim");
+
+        assert_eq!(
+            current_attachment(&registry, &subject_id)
+                .expect("read")
+                .expect("attachment")
+                .claim_id,
+            incumbent,
+            "the incumbent keeps the subject while its successor is only reserved"
+        );
+        assert_eq!(
+            granted_claim(&registry, &subject_id).expect("grant"),
+            Some(incumbent.clone()),
+            "reserving a successor grants nothing to it"
+        );
+        assert_eq!(
+            reserved_claim(&registry, &subject_id).expect("reservation"),
+            Some(reserved),
+            "the reservation is recorded beside the grant, not in place of it"
         );
     }
 
@@ -4684,6 +5169,16 @@ mod tests {
         let first = create(&registry, SPAWN, launch(), None, 1).expect("incumbent");
         let incumbent = first.claim_id.clone().expect("a claim");
         let subject_id = first.subject_id.clone().expect("a subject");
+        append_claim(
+            &registry,
+            &incumbent,
+            "2026-01-01T00:00:01.000Z",
+            crate::control_plane::events::Source::Registration,
+            crate::control_plane::events::Transition::Granted {
+                subject_id: subject_id.clone(),
+            },
+        )
+        .expect("the incumbent holds the subject");
         let request = random_uuid();
         let pending = create_with_intent(
             &registry,
@@ -4700,6 +5195,11 @@ mod tests {
         let reopened = scratch.registry();
         let current = current_attachment(&reopened, &subject_id).unwrap().unwrap();
         assert_eq!(current.claim_id, incumbent);
+        assert_eq!(
+            granted_claim(&reopened, &subject_id).expect("grant"),
+            Some(incumbent.clone()),
+            "withdrawing an undispatched reservation leaves the incumbent's grant intact"
+        );
         assert_eq!(
             read_claim(&reopened, &reserved)
                 .unwrap()
