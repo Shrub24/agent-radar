@@ -332,3 +332,23 @@ A presence report carries the process and the session; the claim id it names is 
 **Rejected alternative:** accept whatever claim id a report names, including an unrecorded one. Rejected: an attachment identity that any caller can invent is not an identity, and the daemon cannot then tell a retry from a new attachment.
 
 **Consequence:** a lost first reply is recovered by reporting again, which is why the claimless path must be idempotent per (registration, session) — that idempotence is the recovery story, not a retry token. The lifecycle boundary is therefore load-bearing: Pi awaits a handler's return value, so the extension's hook wrapper must return its handler's promise or the next session starts before the previous release lands. A session-start reason is context only; nothing branches on it yet, so no field is carried.
+
+## An exit settles the attachments it held; a claimant never reconciles
+
+**Id:** 2f6c8d41-95b7-4e3a-8c02-4d1a7be69f35
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer ruling that a registration exit or shutdown implicitly releases the claims it held, and that the "release if gone" case can never happen, 2026-11-10
+**Verification:** corroborated — `an_execution_that_ended_releases_the_claim_it_held` fails with the settlement disabled (the claim stays `Reserved` through the sweep) and passes with it
+**Revisit when:** an exit can only be observed after a claim is already needed by someone else, which would mean the observation cadence, not the model, is the problem
+
+`record_exit` and its locked twin are the only places an execution's end becomes a fact, and they are what every stop, close, pane death, launch withdrawal and sweep reach. Each releases the claims that execution still held. Presence admission reads who holds a session from recorded state and answers `duplicate` when someone does; it never inspects a holder's process and never releases on the caller's behalf.
+
+**Reason:** a claim whose process had ended kept "holding" its session until the next process arrived and asked for it, so authority ended as a side effect of a request rather than as the consequence of the exit. That made the record wrong between the exit and the next claimant, and it put a process inspection in the middle of claim admission — the one place that should be a pure read of recorded state.
+
+**Rejected alternative:** keep `release_if_gone` at admission as well as releasing on exit. Rejected: two writers for one fact, and the admission-time one runs at exactly the moment a duplicate answer is the honest one.
+
+**Rejected alternative:** let `is_attached` decide by asking the process table whether the holder is alive. Rejected: reads would then reconstruct authority per query, which the same change removes elsewhere; observation belongs to the exit sweep and the pane-death wake.
+
+**Consequence:** between a process dying and the sweep observing it, its claim still reads as held, so a process presenting in that window is answered `duplicate` and succeeds on retry. The sweep's cursor and the pane-death wake are therefore load-bearing for availability, not just for tidiness.

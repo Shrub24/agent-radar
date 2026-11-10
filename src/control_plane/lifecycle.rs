@@ -1939,33 +1939,6 @@ pub fn record_launch_session(
     }
 }
 
-/// Releases a session whose holding process is verifiably gone.
-///
-/// A holder is judged by its own process identity, never by its pane: a live
-/// process holds its session wherever it runs, including a pane it was moved to
-/// or a pane that was closed while the process kept running. Only a process the
-/// process table confirms absent, or whose PID now belongs to another process,
-/// has exited. Procfs that cannot be read is not evidence of absence, so the
-/// holder keeps the session.
-///
-/// Returns whether the holder was released. Reads procfs, so callers run it
-/// outside the registry transition.
-pub fn release_if_gone(
-    registry: &Registry,
-    holder: &Claim,
-    verifier: &dyn crate::control_plane::registry::process::ProcessVerifier,
-    now_ms: i64,
-) -> Result<bool, String> {
-    use crate::control_plane::registry::process::{ProcessVerification, verify_identity};
-    match verify_identity(holder.process.identity.as_ref(), verifier) {
-        ProcessVerification::Absent | ProcessVerification::Mismatched => {
-            record_exit(registry, &holder.process, now_ms)?;
-            Ok(true)
-        }
-        ProcessVerification::Verified | ProcessVerification::Unavailable => Ok(false),
-    }
-}
-
 /// How `registration_id` stands against `session`, read before any verification so a
 /// registration that cannot bind costs no process inspection. The session's subject
 /// is held by whichever of its claims is granted, so this is the only place that
@@ -3241,7 +3214,26 @@ fn record_exit(registry: &Registry, process: &ProcessRecord, now_ms: i64) -> Res
             now_ms,
         )?;
     }
+    // An execution that has ended holds nothing: the claims it held end with it.
+    // Every way an exit is established — a stop, a close, a pane death, a launch
+    // withdrawal, the sweeper — arrives here, so attachment authority ends in one
+    // transition rather than being inferred later from a liveness check.
+    for claim in live_claims_of(registry, &process.registration_id) {
+        release_claim(registry, &claim)?;
+    }
     Ok(())
+}
+
+/// The claims an execution still holds, in recorded order.
+fn live_claims_of(registry: &Registry, registration_id: &RegistrationId) -> Vec<ClaimId> {
+    registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .claims_of_registration(registration_id)
+        .filter(|(_, facts)| !facts.standing.is_terminal())
+        .map(|(claim, _)| claim)
+        .collect()
 }
 
 fn record_exit_locked(
@@ -3259,6 +3251,11 @@ fn record_exit_locked(
         )?;
         execution.exited_at = Some(format_millis(now_ms));
         execution.recorded_at = format_millis(now_ms);
+    }
+    // An execution that has ended holds nothing: the claims it held end with it,
+    // whichever observer established the exit.
+    for claim in live_claims_of(registry, &execution.registration_id) {
+        release_claim(registry, &claim)?;
     }
     Ok(())
 }
@@ -5286,84 +5283,6 @@ mod tests {
         );
     }
 
-    /// Reports every PID as absent, as a process table that no longer lists it does.
-    struct Gone;
-
-    impl ProcessVerifier for Gone {
-        fn inspect(&self, _pid: i32) -> Result<Option<ProcessIdentity>, String> {
-            Ok(None)
-        }
-    }
-
-    /// Reports every PID as owned by another process, as a reused PID is.
-    struct Reused;
-
-    impl ProcessVerifier for Reused {
-        fn inspect(&self, pid: i32) -> Result<Option<ProcessIdentity>, String> {
-            Ok(Some(ProcessIdentity {
-                boot_id: "boot".into(),
-                pid,
-                start_ticks: 7,
-            }))
-        }
-    }
-
-    #[test]
-    fn a_holder_whose_process_is_alive_or_unreadable_keeps_its_session() {
-        // The holder's pane is irrelevant: only its process decides. A live process
-        // holds the session, and an unreadable one is not evidence it is gone.
-        let scratch = Scratch::new("holder-alive");
-        let registry = scratch.registry();
-        let (subject_id, _child, _process) = captured_child(&registry);
-        let holder = read_claim(&registry, &subject_id)
-            .expect("read")
-            .expect("subject");
-
-        assert!(!release_if_gone(&registry, &holder, &LocalProcfsVerifier, 3).expect("verify"));
-        assert!(!release_if_gone(&registry, &holder, &Unreadable, 3).expect("verify"));
-        let held = read_claim(&registry, &subject_id)
-            .expect("read")
-            .expect("subject");
-        assert!(
-            held.process.exited_at.is_none(),
-            "a live or unreadable holder is not an exit"
-        );
-    }
-
-    #[test]
-    fn a_holder_whose_process_is_gone_or_reused_releases_its_session_as_a_verified_exit() {
-        let scratch = Scratch::new("holder-gone");
-        let registry = scratch.registry();
-
-        let (gone_id, _gone, _) = captured_child(&registry);
-        let holder = read_claim(&registry, &gone_id)
-            .expect("read")
-            .expect("subject");
-        assert!(release_if_gone(&registry, &holder, &Gone, 3).expect("verify"));
-        let exited = read_claim(&registry, &gone_id)
-            .expect("read")
-            .expect("subject");
-        assert!(exited.process.exited_at.is_some());
-        assert!(
-            exited.process.ended_externally_at.is_none(),
-            "a confirmed exit is not a pane loss"
-        );
-
-        let (reused_id, _reused, _) = captured_child(&registry);
-        let holder = read_claim(&registry, &reused_id)
-            .expect("read")
-            .expect("subject");
-        assert!(release_if_gone(&registry, &holder, &Reused, 4).expect("verify"));
-        assert!(
-            read_claim(&registry, &reused_id)
-                .expect("read")
-                .expect("subject")
-                .process
-                .exited_at
-                .is_some()
-        );
-    }
-
     #[test]
     fn a_process_that_exited_while_no_daemon_observed_it_is_recorded_by_the_sweep() {
         let scratch = Scratch::new("sweep-exited");
@@ -5383,6 +5302,41 @@ mod tests {
         assert!(
             recorded.process.signalled_at.is_none(),
             "the sweep never signals"
+        );
+    }
+
+    #[test]
+    fn an_execution_that_ended_releases_the_claim_it_held() {
+        // Authority ends where the exit is established, not when the next process
+        // asks for the session: an ended execution holds nothing.
+        let scratch = Scratch::new("exit-releases");
+        let registry = scratch.registry();
+        let (claim_id, mut child, _) = captured_child(&registry);
+        let claim = read_claim(&registry, &claim_id)
+            .expect("read")
+            .expect("a claim");
+        assert!(
+            is_attached(&registry, &claim, 2).expect("attached"),
+            "the claim holds the session while its process runs"
+        );
+        child.0.kill().expect("kill");
+        child.0.wait().expect("reaped");
+
+        let (exited, _) = sweep(&registry, &LocalProcfsVerifier, None, 3).expect("a sweep");
+        assert!(exited >= 1, "the ended execution is observed");
+        assert_eq!(
+            crate::control_plane::registry::presence::decision(&registry, &claim_id)
+                .expect("read")
+                .map(|decision| decision.standing),
+            Some(crate::control_plane::registry::presence::Standing::Released),
+            "the ended execution still held its claim: {:?}",
+            crate::control_plane::registry::presence::decision(&registry, &claim_id)
+                .expect("read")
+                .map(|decision| decision.standing)
+        );
+        assert!(
+            !is_attached(&registry, &claim, 4).expect("attached"),
+            "a released claim still holds the session"
         );
     }
 

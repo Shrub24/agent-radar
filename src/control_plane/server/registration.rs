@@ -58,14 +58,10 @@ pub(super) fn presence_request(
         if process_observation.is_err() {
             return Ok(claim);
         }
-        let mut attachment =
+        // Who holds the session is recorded state, not something a caller's arrival
+        // re-derives: an ended execution releases its claim where it is observed.
+        let attachment =
             subjects::attachment(&registry, &registration_id, &report.session_id, now)?;
-        if let subjects::Attachment::Other(holder) = &attachment
-            && subjects::release_if_gone(&registry, holder, verifier.as_ref(), now)?
-        {
-            attachment =
-                subjects::attachment(&registry, &registration_id, &report.session_id, now)?;
-        }
         if matches!(attachment, subjects::Attachment::Other(_)) {
             claim.standing = Standing::Duplicate;
             claim.subject_id = None;
@@ -121,7 +117,8 @@ pub(super) fn presence_request(
             now,
         )?;
         subjects::record_launch_session(&registry, &registration_id, &report.session_id, now)?;
-        attachment = subjects::attachment(&registry, &registration_id, &report.session_id, now)?;
+        let attachment =
+            subjects::attachment(&registry, &registration_id, &report.session_id, now)?;
         let subject = match attachment {
             subjects::Attachment::Other(_) => {
                 claim.standing = Standing::Duplicate;
