@@ -63,7 +63,11 @@ pub(crate) fn agent_entry(
     // Without this an agent that only ever reported through presence names no
     // place, and the observation cannot join it to the pane it occupies.
     let mut public = registration.public();
-    if let Some(location) = attachment.as_ref().and_then(|claim| claim.location.clone()) {
+    if let Some(location) =
+        crate::control_plane::lifecycle::read_process(registry, &registration.registration_id)?
+            .and_then(|process| process.placement)
+            .map(|placement| placement.location)
+    {
         public.location = Some(location);
     }
     Ok(AgentEntry {

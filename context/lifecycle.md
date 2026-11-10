@@ -254,3 +254,61 @@ Claim, subject and registration ids are canonical UUIDs and are not interchangea
 **Reason it is not done:** `#[serde(transparent)]` keeps the JSON identical and `#[schemars(with = "String")]` keeps the generated schemas identical, so the wire is not the obstacle. The obstacle is that every id at every interface converts once, and the boundary has to be chosen deliberately: domain types first, then the interfaces, then the wire DTOs, each gated. Attempting all three at once produced a 220-error tree that was reverted rather than left half-migrated.
 
 **Consequence:** the class of bug stays reachable — branch close terminated by subject id and resolved nothing, and that was found only by reading the code. Until the change lands, the two lookups are at least named for what they take.
+
+## A claim is the attachment authority; a subject derives its grant from claims
+
+**Id:** 4b8e51c7-2d64-4d9a-9f13-6a7c0e5b8d21
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** design review of the unified execution lifecycle, where the maintainer ruled that a subject's claim state is the source of truth and a query must not reconstruct ownership, 2026-11-10
+**Verification:** corroborated — the whole suite (576 library, 176 control-plane, every integration target) passes with no subject pointer written anywhere, and `a_captured_claim_is_spent_and_survives_reopen` shows presence alone granting no authority
+**Revisit when:** a read needs a subject's attachment history in an order the recorded sequence cannot express, or publication cost measured on a real fleet makes per-claim derivation too slow
+
+`SubjectRecord` holds the durable identity: subject id, session, parentage, owner/run/label. It holds no attachment authority. A claim records its registration, its subject, its session and its **standing** — reserved, pending, granted, duplicate, released — as a recorded transition on the claim's own lifecycle stream. A subject's current grant, its reservation and its previous grant are queries over those claims in recorded order: the newest claim that has not ended is its current attachment, the newest granted one is what authorises, and a released claim keeps its identity and its granted history rather than being deleted.
+
+**Reason:** authority had two writers. The claim's standing lived in `claims/<claim>.json` and `claims/current-<registration>.json`, while the log held the claim's identity and process facts, and `SubjectRecord.current_claim`/`last_claim` were written by whoever moved them last. `release_attachment` cleared the pointer without recording a terminal standing, so a released claim could still read as current, and a reservation wrote `current_claim` at reserve time — which made the pointer mean "reserved or granted" and let a restart displace an incumbent that was still running. Keeping the state in the log gives ordering, replay and one writer; the pointers became a derived index.
+
+**Rejected alternative:** keep subject pointers and treat the claim files as authority for standing only. That was the arrangement that produced both defects, and it leaves two records to keep in step through every transition.
+
+**Rejected alternative:** a separate reservation-hold entity beside claims. Rejected on review: reservation is a claim standing like pending and denied, and a hold would need its own exclusion and grant-eligibility rules, another concept, and the same fencing.
+
+**Rejected alternative:** rebuild ownership by inspecting the process at query time (`release_if_gone`). Rejected: a query must not reconstruct state, and a missed observation would silently change who holds a subject.
+
+**Consequence:** every caller that asked "is this claim current?" now asks two different questions — whether a live process holds the subject (`is_attached`, which a reservation answers yes) and whether this claim may authorise operations (`grants_authority`, which only a grant answers). Tests that asserted pointer movement were restated as authority assertions.
+
+## A reservation is fulfilled by the process that reserved it
+
+**Id:** 9d2f7a14-5c38-4e61-b7a0-3f18c9d2e640
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer ruling after the launch-identity redesign: session start sends registration and session and receives its claim, 2026-11-10
+**Verification:** corroborated — `a_captured_claim_is_spent_and_survives_reopen` (a mismatched session cannot present on the reservation; the matching one presents on the reserved claim and gains no authority from it)
+**Revisit when:** a client needs to present on a claim it holds before the daemon has resolved the registration
+
+Radar mints the claim id a successor holds, including the reserved claim a restart creates. The launched process carries its registration, not a claim: on presence Radar resolves the registration's reservation and returns **that** claim, and enrollment records the grant against it. No claim id travels in the launch environment, and the client no longer mints an attachment identity of its own.
+
+**Reason:** the reserved claim could never be fulfilled otherwise. The daemon reserved claim C2 for the successor, then the client generated its own id and presented with it, so `presence::begin` created a second pending claim and the reservation survived as an orphan that nothing could grant. The path only appeared to work because the grant minted a fresh claim and bypassed the reservation entirely.
+
+**Rejected alternative:** inject the reserved claim id into the child through an environment variable, so the client presents with it. Rejected: it buys nothing a registration does not already carry — the daemon can resolve the reservation from the verified registration — and adds an environment contract that must stay in step with the record.
+
+**Rejected alternative:** keep client-minted ids and drop reservations. Rejected: a restart must name its successor before it exists, which is what reservation is for.
+
+**Consequence:** a client that presents a stale or mismatched claim against a reserved registration is refused rather than served the reservation, and the reservation stays readable by its own registration until it is fulfilled or withdrawn.
+
+## The event log's lock is never held across a read of claims
+
+**Id:** c6a14e58-3b27-4f80-9e5d-8b40f2a71c93
+**Type:** constraint
+**Status:** active
+**Evidence:** confirmed
+**Source:** three hangs found by the integration suites while claim standing moved into the log, 2026-11-10
+**Verification:** corroborated — `a_reservation_with_no_spawn_edge_is_withdrawn_when_it_never_presents` ran over 300 s before the fix and 0.07 s after; the same test is the negative control for the nested-read class
+**Revisit when:** the log's mutex is replaced by finer-grained state, which would change what can be held where
+
+`registry.events` is a non-reentrant mutex, and claim lookups (`current`, `attachment`, `granted_claim`, `reserved_claim`, `decision`) all take it. Any loop that enumerates the log must finish that enumeration, release the guard, and only then consult a claim; a filter that calls a claim reader inside the guard deadlocks its own thread.
+
+**Reason:** this failed three times in one change, each time where an enumeration carried a predicate that had previously been cheap — `unclaimed` calling `settled`, the subject listing filtering on a claim's subject, and `bind_locked` reaching `fence_registration`. It is an incident rather than a theory: `std::sync::Mutex` reports nothing, the thread simply waits on itself, and the symptom is a suite that stops making progress rather than a failing assertion.
+
+**Consequence:** the pattern is "collect under the lock, decide after it", applied in `unclaimed` and the subject listing. A claim read inside a log guard is a defect even when it appears to work, because it only hangs on the path that reaches it.

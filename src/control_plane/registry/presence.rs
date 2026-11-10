@@ -1,12 +1,20 @@
-//! Durable session-load decisions. Presence retries never create claim opportunities.
+//! Claims: the one durable record of an attachment.
+//!
+//! A claim is a proposed or established attachment of a registration to a subject.
+//! Its standing is a recorded transition on the claim's own lifecycle stream, so
+//! ordering, replay and a subject's current, reserved and previous grant all come
+//! from one authority. Nothing here keeps a second copy of that authority: a
+//! subject record holds its durable identity and metadata, and the claim says
+//! which execution is attached to it.
 
-use super::publication::write_atomic;
-use super::{Registry, RegistryLocation, read_record_file, validate_registration_id};
+use super::{Registry, validate_registration_id};
+use crate::control_plane::events::AttachmentFacts;
+pub use crate::control_plane::events::Standing;
+use crate::control_plane::lifecycle;
 use crate::identity::{ClaimId, RegistrationId, SubjectId};
 use serde::{Deserialize, Serialize};
 
-const MAX_BYTES: usize = 64 * 1024;
-
+/// One presence report. Identity is the process's own, never a caller's choice.
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Report {
@@ -20,7 +28,7 @@ pub struct Report {
     #[serde(default)]
     pub subject_id: Option<crate::identity::SubjectId>,
     #[serde(default)]
-    pub location: Option<RegistryLocation>,
+    pub location: Option<super::RegistryLocation>,
     #[serde(default)]
     pub owner: Option<String>,
     #[serde(default)]
@@ -72,9 +80,9 @@ pub fn registration(
             super::spawn::heal_binding(registry, &existing.request, now_ms)?;
             return Ok(existing);
         }
-        if crate::control_plane::lifecycle::read_process(registry, id)?.is_some_and(|process| {
-            process.kind == crate::control_plane::lifecycle::ProcessKind::Command
-        }) {
+        if lifecycle::read_process(registry, id)?
+            .is_some_and(|process| process.kind == lifecycle::ProcessKind::Command)
+        {
             return Err("a managed command is not an agent and cannot be attached".into());
         }
         if super::spawn::launched_registration(registry, Some(id.as_str()))?
@@ -105,16 +113,7 @@ pub fn registration(
     register()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Standing {
-    Reserved,
-    Pending,
-    Granted,
-    Duplicate,
-    Released,
-}
-
+/// What one claim says about itself, as a caller reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Decision {
@@ -124,11 +123,21 @@ pub struct Decision {
     pub standing: Standing,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub subject_id: Option<SubjectId>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub location: Option<RegistryLocation>,
 }
 
-/// The small public receipt; session/location context stays inside Radar.
+impl Decision {
+    fn of(claim_id: &ClaimId, facts: &AttachmentFacts) -> Self {
+        Self {
+            registration_id: facts.registration_id.clone(),
+            claim_id: claim_id.clone(),
+            session_id: facts.session.clone(),
+            standing: facts.standing,
+            subject_id: facts.subject_id.clone(),
+        }
+    }
+}
+
+/// The small public receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Answer {
@@ -144,41 +153,47 @@ impl From<&Decision> for Answer {
         Self {
             registration_id: claim.registration_id.clone(),
             claim_id: claim.claim_id.clone(),
-            standing: claim.standing.clone(),
+            standing: claim.standing,
             subject_id: claim.subject_id.clone(),
         }
     }
 }
 
-fn read(registry: &Registry, name: &str) -> Result<Option<Decision>, String> {
-    let path = registry.root.join("claims").join(name);
-    if !path.try_exists().map_err(|e| e.to_string())? {
-        return Ok(None);
-    }
-    let bytes = read_record_file(&path, MAX_BYTES)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|e| format!("claim {}: {e}", path.display()))
-}
-
-fn write(registry: &Registry, name: &str, claim: &Decision) -> Result<(), String> {
-    let directory = registry.root.join("claims");
-    super::prepare_directory(&directory)?;
-    let bytes = serde_json::to_vec(claim).map_err(|e| e.to_string())?;
-    write_atomic(&directory, &directory.join(name), &bytes, MAX_BYTES)
-}
-
 /// One process's current authority over a subject: the pair a reader needs, and
-/// nothing about how it was established. Resolved once per request so no leaf
-/// re-reads the claims, and copied inward as a value.
+/// nothing about how it was established.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
     pub subject_id: SubjectId,
     pub claim_id: ClaimId,
 }
 
-/// The attachment a registration currently holds, if any. A pending, duplicate
-/// or released claim is not authority.
+/// This claim, as recorded.
+pub fn decision(registry: &Registry, claim_id: &ClaimId) -> Result<Option<Decision>, String> {
+    Ok(registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .facts(claim_id)
+        .map(|facts| Decision::of(claim_id, &facts.attachment)))
+}
+
+/// The newest claim one registration made, whatever its standing.
+pub fn current(
+    registry: &Registry,
+    registration_id: &RegistrationId,
+) -> Result<Option<Decision>, String> {
+    let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(claim) = log.claim_of_registration(registration_id) else {
+        return Ok(None);
+    };
+    Ok(log
+        .facts(&claim)
+        .map(|facts| Decision::of(&claim, &facts.attachment)))
+}
+
+/// The authority a registration holds now. A pending, reserved, duplicate or
+/// released claim is not authority, and a granted one is only authority while it
+/// is still its subject's grant.
 pub fn attachment(
     registry: &Registry,
     registration_id: &RegistrationId,
@@ -189,9 +204,8 @@ pub fn attachment(
     let Some(subject_id) = claim.subject_id else {
         return Ok(None);
     };
-    if claim.standing != Standing::Granted
-        || crate::control_plane::lifecycle::read_subject_record(registry, &subject_id)?
-            .is_none_or(|record| record.current_claim.as_ref() != Some(&claim.claim_id))
+    if !claim.standing.grants_authority()
+        || lifecycle::granted_claim(registry, &subject_id)?.as_ref() != Some(&claim.claim_id)
     {
         return Ok(None);
     }
@@ -201,130 +215,106 @@ pub fn attachment(
     }))
 }
 
-pub fn decision(registry: &Registry, claim_id: &ClaimId) -> Result<Option<Decision>, String> {
-    read(registry, &format!("{claim_id}.json"))
-}
-
-pub fn current(
-    registry: &Registry,
-    registration_id: &RegistrationId,
-) -> Result<Option<Decision>, String> {
-    match read(registry, &format!("current-{registration_id}.json"))? {
-        Some(pointer) => read(registry, &format!("{}.json", pointer.claim_id)),
-        None => Ok(None),
-    }
-}
-
-/// Caller serializes presence decisions, including verification and binding.
+/// Starts or reasserts a presence attempt. Callers serialize presence decisions;
+/// nothing here takes the transition lock, so a launch reservation that already
+/// holds it cannot deadlock.
 pub fn begin(
     registry: &Registry,
     registration_id: &RegistrationId,
     claim_id: &ClaimId,
     session_id: &str,
-    location: Option<RegistryLocation>,
+    now_ms: i64,
 ) -> Result<Decision, String> {
     validate_registration_id(session_id)?;
-    let name = format!("{claim_id}.json");
-    if let Some(mut claim) = read(registry, &name)? {
-        if &claim.registration_id != registration_id
-            || claim.session_id.as_deref() != Some(session_id)
+    let execution = lifecycle::adopted_execution(registry, registration_id, now_ms)?;
+    let recorded = decision(registry, claim_id)?;
+    if let Some(existing) = &recorded {
+        if &existing.registration_id != registration_id
+            || existing.session_id.as_deref() != Some(session_id)
         {
             return Err("claim ID already identifies a different process or session".into());
         }
-        if current(registry, registration_id)?
-            .is_some_and(|c| &c.claim_id != claim_id && c.standing != Standing::Released)
+        if let Some(newer) = current(registry, registration_id)?
+            && newer.claim_id != *claim_id
+            && !newer.standing.is_terminal()
         {
-            claim.standing = Standing::Released;
-            claim.subject_id = None;
-            write(registry, &name, &claim)?;
-            return Ok(claim);
+            let released = release(registry, registration_id, claim_id)?;
+            return Ok(released);
         }
-        if location.is_some() {
-            claim.location = location;
+        if matches!(existing.standing, Standing::Reserved) {
+            lifecycle::claim_presence(registry, claim_id, session_id, now_ms)?;
+            return Ok(decision(registry, claim_id)?.unwrap_or_else(|| existing.clone()));
         }
-        save(registry, &claim)?;
-        return Ok(claim);
+        return Ok(existing.clone());
     }
-    if let Some(mut previous) = current(registry, registration_id)?
-        && previous.standing != Standing::Reserved
+    // A registration that reserved a claim presents on that claim: the identity is
+    // Radar's, not one the client chose.
+    if let Some(reserved) = lifecycle::reservation_for(registry, registration_id)? {
+        lifecycle::claim_presence(registry, &reserved, session_id, now_ms)?;
+        return decision(registry, &reserved)?
+            .ok_or_else(|| "the reserved claim was not readable".into());
+    }
+    if let Some(previous) = current(registry, registration_id)?
+        && previous.claim_id != *claim_id
+        && !matches!(previous.standing, Standing::Reserved)
     {
-        crate::control_plane::lifecycle::release_attachment(
-            registry,
-            &previous.claim_id,
-            previous.subject_id.as_ref(),
-        )?;
-        previous.standing = Standing::Released;
-        previous.subject_id = None;
-        write(registry, &format!("{}.json", previous.claim_id), &previous)?;
-        write(
-            registry,
-            &format!("current-{registration_id}.json"),
-            &previous,
-        )?;
+        release(registry, registration_id, &previous.claim_id)?;
     }
-    let claim = Decision {
-        registration_id: registration_id.clone(),
-        claim_id: claim_id.clone(),
-        session_id: Some(session_id.into()),
-        standing: Standing::Pending,
-        subject_id: None,
-        location,
-    };
-    save(registry, &claim)?;
-    Ok(claim)
+    lifecycle::admit_claim(
+        registry,
+        claim_id,
+        execution,
+        session_id,
+        Standing::Pending,
+        now_ms,
+    )?;
+    decision(registry, claim_id)?.ok_or_else(|| "the presence claim was not recorded".into())
 }
 
-/// A launch reserves its subject before the process can report a session. This
-/// does not grant any reader authority; only a verified presence report can.
+/// Records what a caller decided about a claim it already began.
+pub fn record(registry: &Registry, decision: &Decision, now_ms: i64) -> Result<(), String> {
+    lifecycle::record_claim_standing(registry, decision, now_ms)
+}
+
+/// Holds a subject for a launch that has not presented. Not authority: it excludes
+/// competing attachments until this registration presents or is withdrawn.
 pub fn reserve(
     registry: &Registry,
     registration_id: &RegistrationId,
     claim_id: &ClaimId,
     subject_id: &SubjectId,
     session_id: Option<String>,
+    now_ms: i64,
 ) -> Result<(), String> {
-    save(
+    if let Some(existing) = decision(registry, claim_id)? {
+        if &existing.registration_id != registration_id {
+            return Err("claim ID already identifies a different process".into());
+        }
+        lifecycle::reserve_claim(registry, claim_id, subject_id, session_id, now_ms)?;
+        return Ok(());
+    }
+    let execution = lifecycle::read_process(registry, registration_id)?
+        .ok_or("a reservation is recorded for a launched execution")?;
+    lifecycle::admit_claim(
         registry,
-        &Decision {
-            registration_id: registration_id.clone(),
-            claim_id: claim_id.clone(),
-            subject_id: Some(subject_id.clone()),
-            session_id,
-            standing: Standing::Reserved,
-            location: None,
-        },
+        claim_id,
+        execution,
+        session_id.as_deref().unwrap_or_default(),
+        Standing::Reserved,
+        now_ms,
     )
 }
 
-/// Decision first, current projection second. Reassertion heals an interrupted projection.
-pub fn save(registry: &Registry, claim: &Decision) -> Result<(), String> {
-    write(registry, &format!("{}.json", claim.claim_id), claim)?;
-    write(
-        registry,
-        &format!("current-{}.json", claim.registration_id),
-        claim,
-    )
-}
-
+/// Ends this claim's authority, keeping it as the record of what it was.
 pub fn release(
     registry: &Registry,
     registration_id: &RegistrationId,
     claim_id: &ClaimId,
 ) -> Result<Decision, String> {
-    let mut claim = read(registry, &format!("{claim_id}.json"))?.ok_or("claim is not recorded")?;
-    if &claim.registration_id != registration_id {
+    let existing = decision(registry, claim_id)?.ok_or("claim is not recorded")?;
+    if &existing.registration_id != registration_id {
         return Err("claim belongs to another registration".into());
     }
-    crate::control_plane::lifecycle::release_attachment(
-        registry,
-        claim_id,
-        claim.subject_id.as_ref(),
-    )?;
-    claim.standing = Standing::Released;
-    claim.subject_id = None;
-    write(registry, &format!("{claim_id}.json"), &claim)?;
-    if current(registry, registration_id)?.is_some_and(|c| &c.claim_id == claim_id) {
-        write(registry, &format!("current-{registration_id}.json"), &claim)?;
-    }
-    Ok(claim)
+    lifecycle::release_claim(registry, claim_id)?;
+    decision(registry, claim_id)?.ok_or_else(|| "claim disappeared while releasing".into())
 }

@@ -11,13 +11,7 @@ pub(crate) fn read(
     now_ms: i64,
     verify: impl FnOnce(Option<ProcessIdentity>) -> ProcessVerification,
 ) -> Result<Subject, String> {
-    let claim = record
-        .current_claim
-        .as_ref()
-        .or(record.last_claim.as_ref())
-        .map(|id| lifecycle::read_claim(registry, id))
-        .transpose()?
-        .flatten();
+    let claim = lifecycle::current_attachment(registry, &record.subject_id)?;
     let mut result = Subject {
         subject_id: record.subject_id.clone(),
         session_id: record.session,
@@ -40,7 +34,8 @@ pub(crate) fn read(
     let Some(claim) = claim else {
         return Ok(result);
     };
-    let current = record.current_claim.as_ref() == Some(&claim.claim_id);
+    let current =
+        lifecycle::granted_claim(registry, &record.subject_id)?.as_ref() == Some(&claim.claim_id);
     let process = &claim.process;
     result.scoped = Some(process.scope.is_some());
     let standing = presence::decision(registry, &claim.claim_id)?;
@@ -63,11 +58,15 @@ pub(crate) fn read(
     if current {
         let registration = registry.get(&process.registration_id)?;
         if result.state == AttachmentState::Live {
-            result.location = standing.and_then(|decision| decision.location).or_else(|| {
-                registration
-                    .as_ref()
-                    .and_then(|r| r.request.location.clone())
-            });
+            result.location = process
+                .placement
+                .as_ref()
+                .map(|placement| placement.location.clone())
+                .or_else(|| {
+                    registration
+                        .as_ref()
+                        .and_then(|r| r.request.location.clone())
+                });
         }
         let channel = |kind| -> Result<Option<ChannelFacts>, String> {
             Ok(registry
@@ -82,8 +81,8 @@ pub(crate) fn read(
     }
     // Verification is external; a concurrent attachment change invalidates this
     // sample rather than letting it describe the replacement with old evidence.
-    if lifecycle::read_subject_record(registry, &record.subject_id)?
-        .is_none_or(|latest| latest.current_claim != record.current_claim)
+    if lifecycle::granted_claim(registry, &record.subject_id)?
+        != lifecycle::granted_claim(registry, &record.subject_id)?
     {
         result.state = AttachmentState::Unknown;
         result.location = None;

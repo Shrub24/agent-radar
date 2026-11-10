@@ -164,16 +164,10 @@ pub(super) fn run_close(
     }
     if let Some(expected) = &close_request.execution {
         let registry = Arc::clone(&locked(core).registry);
-        let current = subjects::read_subject_record(&registry, &expected.subject_id)
+        let current = subjects::current_attachment(&registry, &expected.subject_id)
             .ok()
             .flatten()
-            .is_some_and(|subject| {
-                subject
-                    .current_claim
-                    .as_ref()
-                    .or(subject.last_claim.as_ref())
-                    == Some(&expected.claim_id)
-            });
+            .is_some_and(|claim| claim.claim_id == expected.claim_id);
         let valid = current
             && subjects::read_claim(&registry, &expected.claim_id)
                 .ok()

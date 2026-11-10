@@ -69,6 +69,28 @@ pub struct Facts {
     pub execution: ProcessFacts,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Standing {
+    Reserved,
+    Pending,
+    Granted,
+    Duplicate,
+    Released,
+}
+
+impl Standing {
+    /// Whether this claim may carry subject authority. It is eligibility only:
+    /// the subject's granted attachment must still be this claim.
+    pub fn grants_authority(self) -> bool {
+        matches!(self, Self::Granted)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Duplicate | Self::Released)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttachmentFacts {
@@ -79,6 +101,14 @@ pub struct AttachmentFacts {
     pub subject_id: Option<SubjectId>,
     #[serde(default)]
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,
+    /// Where this attachment stands among the claims on its subject. The claim is
+    /// the authority; a subject's current, reserved and previous grant are read
+    /// from these standings in recorded order.
+    pub standing: Standing,
+    /// When this claim was granted, so a released claim still records that it once
+    /// held its subject. Set once; a later release does not clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<String>,
 }
 
 /// One registration's public process evidence. Recipes and captured environment
@@ -118,6 +148,10 @@ impl Facts {
                 subject_id: Some(subject.subject_id.clone()),
                 managed: subject.managed.clone(),
                 session: subject.session.clone(),
+                // Standing is recorded by its own transition, never implied by
+                // writing an attachment: this baseline describes the facts.
+                standing: Standing::Pending,
+                granted_at: None,
             },
             execution: ProcessFacts::from(&subject.process),
         }
@@ -207,6 +241,34 @@ pub enum Transition {
     SessionRecorded {
         session: String,
     },
+    /// Records the durable subject this attachment belongs to, once it is known.
+    /// A presence attempt starts before the subject is resolved.
+    Attached {
+        subject_id: SubjectId,
+    },
+    /// Holds a subject for a launch that has not presented yet. Not authority: it
+    /// excludes competing attachments until this registration presents or is
+    /// withdrawn.
+    Reserved {
+        subject_id: SubjectId,
+        session: Option<String>,
+    },
+    /// A presence report on a claim with no subject yet, before anything authorizes
+    /// it. Its own event so an interrupted decision leaves a readable attempt.
+    Presence {
+        session: String,
+    },
+    /// Authorizes this claim over its subject. The claim, not the subject record,
+    /// is where an attachment becomes current.
+    Granted {
+        subject_id: SubjectId,
+    },
+    /// The session is already attached elsewhere, so this claim never authorizes.
+    Duplicate {
+        session: String,
+    },
+    /// Ends this claim's authority, keeping it as the record of what it was.
+    Released,
     OperationAdmitted(RequestRecord),
     OperationStarted(RequestRecord),
     OperationSettled(RequestRecord),
@@ -287,6 +349,9 @@ pub struct Log {
     directory: PathBuf,
     next_seq: u64,
     facts: BTreeMap<ClaimId, AttachmentFacts>,
+    /// The sequence that last changed each claim, so "current", "reserved" and
+    /// "previous grant" are read in recorded order rather than guessed from ids.
+    claim_seq: BTreeMap<ClaimId, u64>,
     processes: BTreeMap<RegistrationId, ProcessFacts>,
     operations: BTreeMap<String, RequestRecord>,
     containers: BTreeMap<String, Container>,
@@ -335,6 +400,7 @@ impl Log {
             directory: directory.to_owned(),
             next_seq: 1,
             facts: BTreeMap::new(),
+            claim_seq: BTreeMap::new(),
             processes: BTreeMap::new(),
             operations: BTreeMap::new(),
             containers: BTreeMap::new(),
@@ -441,6 +507,59 @@ impl Log {
 
     pub fn ids(&self) -> impl Iterator<Item = &ClaimId> {
         self.facts.keys()
+    }
+
+    /// Every claim on one subject, newest change first.
+    pub fn claims_of_subject<'a>(
+        &'a self,
+        subject_id: &'a SubjectId,
+    ) -> impl Iterator<Item = (ClaimId, &'a AttachmentFacts)> + 'a {
+        let mut matched: Vec<(u64, ClaimId)> = self
+            .facts
+            .iter()
+            .filter(|(_, facts)| facts.subject_id.as_ref() == Some(subject_id))
+            .map(|(claim, _)| {
+                (
+                    self.claim_seq.get(claim).copied().unwrap_or(0),
+                    claim.clone(),
+                )
+            })
+            .collect();
+        matched.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        matched
+            .into_iter()
+            .filter_map(move |(_, claim)| self.facts.get(&claim).map(|facts| (claim, facts)))
+    }
+
+    /// Every claim one registration made, newest change first.
+    pub fn claims_of_registration<'a>(
+        &'a self,
+        registration_id: &'a RegistrationId,
+    ) -> impl Iterator<Item = (ClaimId, &'a AttachmentFacts)> + 'a {
+        let mut matched: Vec<(u64, ClaimId)> = self
+            .facts
+            .iter()
+            .filter(|(_, facts)| &facts.registration_id == registration_id)
+            .map(|(claim, _)| {
+                (
+                    self.claim_seq.get(claim).copied().unwrap_or(0),
+                    claim.clone(),
+                )
+            })
+            .collect();
+        matched.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        matched
+            .into_iter()
+            .filter_map(move |(_, claim)| self.facts.get(&claim).map(|facts| (claim, facts)))
+    }
+
+    /// The newest claim for one registration, whatever its standing.
+    pub fn claim_of_registration(&self, registration_id: &RegistrationId) -> Option<ClaimId> {
+        self.facts
+            .iter()
+            .filter(|(_, facts)| &facts.registration_id == registration_id)
+            .max_by_key(|(claim, _)| self.claim_seq.get(*claim).copied().unwrap_or(0))
+            .map(|(claim, _)| claim.clone())
     }
 
     /// Materialized attachment views over the one process owner per registration.
@@ -562,6 +681,8 @@ impl Log {
                     subject_id: None,
                     managed: Default::default(),
                     session: None,
+                    standing: Standing::Pending,
+                    granted_at: None,
                 },
                 execution: execution.clone(),
             }),
@@ -662,6 +783,7 @@ impl Log {
                     .insert(facts.attachment.registration_id.clone(), facts.execution);
                 if let Stream::Claim(claim) = stream {
                     self.facts.insert(claim.clone(), facts.attachment);
+                    self.claim_seq.insert(claim.clone(), event.seq);
                 }
             }
         }
@@ -762,6 +884,50 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
                 && facts.execution.ended_externally_at.is_none() =>
         {
             facts.attachment.session = Some(session.clone())
+        }
+        Transition::Attached { subject_id }
+            if facts.attachment.subject_id.is_none()
+                && !facts.attachment.standing.is_terminal() =>
+        {
+            facts.attachment.subject_id = Some(subject_id.clone());
+        }
+        Transition::Reserved {
+            subject_id,
+            session,
+        } if !facts.attachment.standing.is_terminal()
+            && facts.execution.exited_at.is_none()
+            && facts.execution.ended_externally_at.is_none() =>
+        {
+            facts.attachment.subject_id = Some(subject_id.clone());
+            facts.attachment.session = session.clone();
+            facts.attachment.standing = Standing::Reserved;
+        }
+        Transition::Presence { session }
+            if matches!(
+                facts.attachment.standing,
+                Standing::Reserved | Standing::Pending
+            ) && facts.execution.exited_at.is_none() =>
+        {
+            facts.attachment.session = Some(session.clone());
+            facts.attachment.standing = Standing::Pending;
+        }
+        Transition::Granted { subject_id }
+            if matches!(
+                facts.attachment.standing,
+                Standing::Reserved | Standing::Pending
+            ) && facts.execution.exited_at.is_none()
+                && facts.execution.ended_externally_at.is_none() =>
+        {
+            facts.attachment.subject_id = Some(subject_id.clone());
+            facts.attachment.standing = Standing::Granted;
+            facts.attachment.granted_at = Some(event.at.clone());
+        }
+        Transition::Duplicate { session } if !facts.attachment.standing.is_terminal() => {
+            facts.attachment.session = Some(session.clone());
+            facts.attachment.standing = Standing::Duplicate;
+        }
+        Transition::Released if !facts.attachment.standing.is_terminal() => {
+            facts.attachment.standing = Standing::Released;
         }
         _ => return Err("invalid lifecycle transition".into()),
     }

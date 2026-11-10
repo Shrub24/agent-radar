@@ -156,7 +156,10 @@ pub(super) fn subject_read_request(
                 Err(error) => return registry_error(request, error),
             }
         };
-        let claim = record.current_claim.clone();
+        let claim = match subjects::granted_claim(&registry, &record.subject_id) {
+            Ok(claim) => claim,
+            Err(error) => return registry_error(request, error),
+        };
         let subject_id = record.subject_id.clone();
         let projected = project(record);
         // A read that verified a process was already in flight when the daemon
@@ -197,8 +200,14 @@ pub(super) fn subject_read_request(
                     Err(refusal) => return Response::refused(&request.id, &refusal),
                 };
                 let foreground = foreground_read(core, pane).ok();
-                let latest = match subjects::read_subject_record(&registry, &subject_id) {
-                    Ok(Some(record)) if record.current_claim == claim => project(record),
+                let latest = match subjects::granted_claim(&registry, &subject_id) {
+                    Ok(latest) if latest == claim => {
+                        match subjects::read_subject_record(&registry, &subject_id) {
+                            Ok(Some(record)) => project(record),
+                            Ok(None) => Err("subject disappeared during inspection".to_string()),
+                            Err(error) => Err(error),
+                        }
+                    }
                     _ => {
                         return Response::refused(
                             &request.id,

@@ -51,7 +51,7 @@ pub(super) fn presence_request(
             &registration_id,
             &claim_id,
             &report.session_id,
-            None,
+            now,
         )?;
         if matches!(claim.standing, Standing::Released | Standing::Duplicate) {
             return Ok(claim);
@@ -70,7 +70,7 @@ pub(super) fn presence_request(
         if matches!(attachment, subjects::Attachment::Other(_)) {
             claim.standing = Standing::Duplicate;
             claim.subject_id = None;
-            presence::save(&registry, &claim)?;
+            presence::record(&registry, &claim, now)?;
             return Ok(claim);
         }
         let Some(backend) = backend else {
@@ -100,7 +100,15 @@ pub(super) fn presence_request(
             &registration_id,
             &claim_id,
             &report.session_id,
-            report.location.clone(),
+            now,
+        )?;
+        // Where this execution runs is the execution's own fact: presence verified
+        // the pane, so it is recorded there rather than held on the claim.
+        subjects::place(
+            &registry,
+            &registration_id,
+            super::launch::placement(&backend, &verifier, pane, &stopping, verification),
+            now,
         )?;
         registry::context::report_presence(
             &registry,
@@ -119,10 +127,10 @@ pub(super) fn presence_request(
             subjects::Attachment::Other(_) => {
                 claim.standing = Standing::Duplicate;
                 claim.subject_id = None;
-                presence::save(&registry, &claim)?;
+                presence::record(&registry, &claim, now)?;
                 return Ok(claim);
             }
-            subjects::Attachment::Own(subject) if subject.claim_id == report.claim_id => *subject,
+            subjects::Attachment::Own(subject) if subject.claim_id == claim.claim_id => *subject,
             subjects::Attachment::Own(_) | subjects::Attachment::Free => {
                 let id = record_enrollment(
                     &registry,
@@ -132,7 +140,7 @@ pub(super) fn presence_request(
                         session: report.session_id,
                     },
                     &report.process,
-                    &report.claim_id,
+                    &claim.claim_id,
                     now,
                 )?;
                 subjects::read_claim(&registry, &id)?.ok_or("enrolled subject is missing")?
@@ -148,7 +156,7 @@ pub(super) fn presence_request(
         }
         claim.subject_id = Some(subject_id.clone());
         claim.standing = Standing::Granted;
-        presence::save(&registry, &claim)?;
+        presence::record(&registry, &claim, now)?;
         if registry
             .spawn_edge(&subject.process.spawn_request_id)?
             .is_some()

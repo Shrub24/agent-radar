@@ -425,8 +425,6 @@ mod tests {
                 ..ManagedMetadata::default()
             },
             session: Some("session".into()),
-            current_claim: Some(crate::identity::ClaimId::random()),
-            last_claim: Some(crate::identity::ClaimId::random()),
             recorded_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
         }

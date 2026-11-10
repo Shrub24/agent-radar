@@ -850,16 +850,14 @@ pub(super) fn cancel_target(
     // has no claim to name, which is the ordinary state of a launch in flight.
     match (params.claim_id.as_ref(), claim.as_ref()) {
         (Some(requested), Some(claim)) => {
-            let current =
-                subjects::read_subject_record(registry, &claim.subject_id).map_err(internal)?;
-            // The newest attempt is what a caller may act on, and a reserved
-            // successor is the subject's current claim from the moment the
-            // restart reserves it; a stale release still cannot act.
+            // A granted or reserved claim is what a caller may act on: a reserved
+            // successor is named before it presents, and a stale release cannot act.
+            let granted = subjects::granted_claim(registry, &claim.subject_id).map_err(internal)?;
+            let reserved =
+                subjects::reserved_claim(registry, &claim.subject_id).map_err(internal)?;
             if requested != &claim.claim_id
-                || current.is_none_or(|record| {
-                    record.current_claim.as_ref().or(record.last_claim.as_ref())
-                        != Some(&claim.claim_id)
-                })
+                || (granted.as_ref() != Some(&claim.claim_id)
+                    && reserved.as_ref() != Some(&claim.claim_id))
             {
                 return Err(Refusal::new(
                     Code::Refused,

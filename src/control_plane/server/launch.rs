@@ -303,12 +303,23 @@ pub(super) fn continuation(
     let record = subjects::read_subject_record(&registry, &subject_id)
         .map_err(|error| Refusal::new(Code::BadParams, error))?
         .ok_or_else(|| Refusal::new(Code::NotFound, "the subject to continue is not recorded"))?;
-    let (Some(session), Some(last)) = (record.session.as_deref(), record.last_claim.clone()) else {
+    let Some(session) = record.session.as_deref() else {
         return Err(refuse("the subject has no recorded session to continue"));
     };
-    if record.current_claim.is_some() {
+    if subjects::granted_claim(&registry, &subject_id)
+        .map_err(internal)?
+        .is_some()
+        || subjects::reserved_claim(&registry, &subject_id)
+            .map_err(internal)?
+            .is_some()
+    {
         return Err(refuse("the subject is attached; nothing was started"));
     }
+    let Some(previous) = subjects::current_attachment(&registry, &subject_id).map_err(internal)?
+    else {
+        return Err(refuse("the subject has no recorded attachment to continue"));
+    };
+    let last = previous.claim_id;
     let previous = subjects::read_claim(&registry, &last)
         .map_err(internal)?
         .ok_or_else(|| refuse("the subject's last attachment is unavailable"))?;
@@ -1031,7 +1042,7 @@ pub(super) fn complete_request(core: &Arc<Mutex<Core>>, request: &Request) -> Re
 /// Where an admitted execution runs: the pane that reported it, and the serving
 /// instance verified now. A placement recorded without an instance removes no
 /// pane later; the execution itself is still tracked.
-fn placement(
+pub(super) fn placement(
     backend: &Arc<dyn RuntimeProvider>,
     verifier: &Arc<dyn ProcessVerifier>,
     pane: &str,

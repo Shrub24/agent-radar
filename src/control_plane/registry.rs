@@ -849,8 +849,11 @@ impl Registry {
         &self,
         mut registration: Registration,
     ) -> Result<Registration, String> {
-        if let Some(claim) = presence::current(self, &registration.registration_id)? {
-            registration.request.location = claim.location;
+        if let Some(process) =
+            crate::control_plane::lifecycle::read_process(self, &registration.registration_id)?
+            && let Some(placement) = process.placement
+        {
+            registration.request.location = Some(placement.location);
         }
         Ok(registration)
     }
