@@ -820,8 +820,8 @@ pub fn ui_row_id(id: &RowId) -> dto::UiRowId {
             session: task.session.clone(),
             id: task.id.clone(),
         },
-        RowId::Lifecycle(subject_id) => dto::UiRowId::Lifecycle {
-            subject_id: subject_id.clone(),
+        RowId::Lifecycle(registration_id) => dto::UiRowId::Lifecycle {
+            registration_id: registration_id.clone(),
         },
     }
 }
@@ -837,7 +837,7 @@ pub fn row_id(id: &dto::UiRowId) -> RowId {
             session: session.clone(),
             id: id.clone(),
         }),
-        dto::UiRowId::Lifecycle { subject_id } => RowId::Lifecycle(subject_id.clone()),
+        dto::UiRowId::Lifecycle { registration_id } => RowId::Lifecycle(registration_id.clone()),
     }
 }
 

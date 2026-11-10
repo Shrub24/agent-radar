@@ -71,6 +71,9 @@ pub struct RegistryRead {
     /// Durable containers, which the backend's own inventory does not carry: a
     /// fleet Radar created has a topology of its own.
     pub containers: Vec<PublicContainer>,
+    /// Every execution, attached or not, with its placement and attachment refs.
+    /// A row is one of these joined to what it holds now.
+    pub executions: Vec<crate::model::ExecutionObservation>,
 }
 
 /// The safe identity fields from `lifecycle.list`; private launch data is never
@@ -245,6 +248,7 @@ pub fn project(
     evidence: &[(String, ForegroundEvidence)],
 ) -> Vec<AgentObservation> {
     let RegistryRead {
+        executions: _,
         agents,
         topology,
         lifecycle,
@@ -619,6 +623,7 @@ mod tests {
             focus: Default::default(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
             workspaces: Vec::new(),
             tabs: Vec::new(),
             panes,

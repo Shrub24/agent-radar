@@ -613,6 +613,58 @@ pub struct LifecycleObservation {
     pub ended: bool,
 }
 
+/// One execution: a process incarnation and what it is doing, joined to the
+/// attachment it holds or is about to hold.
+///
+/// Identity is the registration. The claim references are separate because they
+/// answer different questions: `claim_id` is the attachment that holds the subject
+/// now, `reserved_claim_id` is the exclusive entitlement waiting for a process that
+/// has not presented. Neither is derived from the other, and a row shows both
+/// without pretending one is the other.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionObservation {
+    pub registration_id: crate::identity::RegistrationId,
+    pub state: LifecycleState,
+    pub origin: ExecutionOrigin,
+    /// Where this execution runs, as the daemon recorded it when it verified the
+    /// pane. A pane is joined to its row by this, and only this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::control_plane::lifecycle::Placement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<crate::identity::SubjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<crate::identity::ClaimId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_claim_id: Option<crate::identity::ClaimId>,
+    /// The identity the daemon verified for this execution's process, once it has
+    /// one. A launch that has not presented has none, and its row says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<crate::model::ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_registration_id: Option<crate::identity::RegistrationId>,
+    /// The session its attachment carries, when one is attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Whether the daemon recorded this execution's process as ended.
+    #[serde(default)]
+    pub ended: bool,
+}
+
+/// How an execution came to be tracked.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionOrigin {
+    /// Radar started it.
+    #[default]
+    Spawned,
+    /// An already-running process reported itself.
+    Enrolled,
+    /// A program Radar admitted in place.
+    Admitted,
+}
+
 /// Where the unified operator's tmux client is looking, read with the inventory
 /// so the two describe one moment.
 ///
@@ -662,6 +714,11 @@ pub struct FleetObservation {
     /// tree suppresses subjects already represented by a joined agent row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_subjects: Vec<LifecycleObservation>,
+    /// Every execution this daemon records, whether or not a session has attached
+    /// it yet. A row is one execution joined to its optional attachment, so a
+    /// launch in flight is published here before it presents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executions: Vec<ExecutionObservation>,
     #[serde(default, skip_serializing_if = "Focus::is_unreported")]
     pub focus: Focus,
 }

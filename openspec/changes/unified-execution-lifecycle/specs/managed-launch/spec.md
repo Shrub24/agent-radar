@@ -64,11 +64,23 @@ The integration SHALL preserve Pi's ordered awaited shutdown/start hooks, includ
 - **THEN** only the named predecessor claim releases and the reservation remains unchanged, without a Reserved skip in generic replacement logic
 
 ### Requirement: Registration finalisation settles its outstanding claims
-Session shutdown SHALL use the shared exact-claim release transition. Verified execution end and failed-launch withdrawal SHALL use shared explicit registration finalisation to settle outstanding attachments and applicable launch-owned resources. Finalisation SHALL be idempotent through existing durable recovery seams, retain history and prevent late grant on a terminal execution. It SHALL NOT introduce a separate workflow engine or completion store.
+Session shutdown SHALL normally release the exact claim. Authenticated supervisor completion SHALL be the primary process-exit signal and main fallback release, without waiting for tmux or sweep. It, verified fallback exits and failed launches SHALL share idempotent registration finalisation that settles outstanding claims, retains history and refuses late grants. Completion SHALL NOT authorise pane removal. No new workflow engine or completion store SHALL be added.
 
-#### Scenario: A process exits without session shutdown
-- **WHEN** the observer verifies the registered process has ended
-- **THEN** its execution end is recorded and its outstanding claims settle without waiting for a new claimant to discover its death
+#### Scenario: Supervisor completion follows a missed shutdown
+- **WHEN** the supervisor reports authenticated completion for an execution whose session shutdown did not release its claims
+- **THEN** execution end, code or signal, and release of its outstanding claims are recorded without waiting for a pane notification or sweep
+
+#### Scenario: Supervisor completion follows session shutdown
+- **WHEN** the exact session claim has already released and its supervisor reports completion
+- **THEN** completion is retained and repeated release has no effect on another claim or registration
+
+#### Scenario: A fallback observation arrives before completion
+- **WHEN** a verified process observation finalises an execution before its supervisor report arrives
+- **THEN** the later authenticated report records missing completion details without repeating settled cleanup or affecting a successor
+
+#### Scenario: A process exits without a supervisor report
+- **WHEN** a fallback observer verifies the registered process has ended after its supervisor report was missed
+- **THEN** the same registration finalisation records execution end and settles its outstanding claims without fabricating a completion code
 
 #### Scenario: Finalisation is interrupted
 - **WHEN** terminal execution evidence is durable but its claim or resource cleanup has not settled

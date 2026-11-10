@@ -1397,7 +1397,7 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, ink: RowInk, marks: Marks) -> Lis
         }
         RowKind::Lifecycle(lifecycle) => {
             let moving = matches!(
-                lifecycle.subject.state,
+                lifecycle.execution.state,
                 crate::control_plane::lifecycle::State::Pending
                     | crate::control_plane::lifecycle::State::Captured
             );
@@ -2050,6 +2050,7 @@ mod tests {
             focus: Default::default(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
@@ -2320,6 +2321,7 @@ mod tests {
             focus: Default::default(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
             workspaces: vec![crate::model::Workspace {
                 workspace_id: "wL".into(),
                 label: Some("long".into()),
@@ -6892,6 +6894,7 @@ mod tests {
             focus: Default::default(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),

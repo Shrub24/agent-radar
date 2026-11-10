@@ -16,8 +16,7 @@ use std::time::Duration;
 
 use crate::control_plane::containers::Kind;
 use crate::model::{
-    AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, LifecycleObservation,
-    Pane, TerminalMode,
+    AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Pane, TerminalMode,
 };
 use crate::observation::{ObservationState, RetentionBasis};
 use crate::registry_observation::{Binding, RegistryView};
@@ -139,8 +138,10 @@ pub enum RowId {
     Pane(String),
     /// Background-task row, keyed by owner, session and task id.
     Task(TaskId),
-    /// A daemon lifecycle subject not yet represented by a joined agent row.
-    Lifecycle(crate::identity::SubjectId),
+    /// A daemon execution not represented by a joined agent row: an attached one
+    /// with no agent facts yet, or one in flight with no attachment at all. Keyed
+    /// by the registration, which identifies the process incarnation.
+    Lifecycle(crate::identity::RegistrationId),
 }
 
 /// A display-ready row: everything the tree needs to place it and the detail
@@ -187,8 +188,12 @@ impl TreeRow {
             // it: the id is what a filter is usually typed from.
             RowKind::Task(task) => [Some(&task.id.id), None],
             RowKind::Lifecycle(lifecycle) => [
-                Some(lifecycle.subject.subject_id.as_str()),
-                Some(lifecycle_state_label(lifecycle.subject.state)),
+                lifecycle
+                    .execution
+                    .subject_id
+                    .as_ref()
+                    .map(|id| id.as_str()),
+                Some(lifecycle_state_label(lifecycle.execution.state)),
             ],
             _ => [None, None],
         };
@@ -262,15 +267,28 @@ pub enum RowKind {
 /// A daemon lifecycle subject without a joined agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LifecycleRow {
-    pub subject: LifecycleObservation,
+    /// The execution this row is. A row is one process incarnation joined to the
+    /// attachment it holds or is about to hold; the subject is the identity the
+    /// attachment carries, and is absent while a launch has not presented.
+    pub execution: crate::model::ExecutionObservation,
     pub title: String,
 }
 
 impl LifecycleRow {
-    /// Whether this subject is history: its process is recorded as ended. The
-    /// subject itself is kept so it can be continued.
+    /// Whether this execution is history: its process is recorded as ended. The
+    /// subject is kept so it can be continued.
     pub fn history(&self) -> bool {
-        self.subject.ended
+        self.execution.ended
+    }
+
+    /// Whether this row is a launched process nobody has attached yet: it may not
+    /// have presented, so it holds no subject.
+    pub fn unjoined(&self) -> bool {
+        self.execution.subject_id.is_none()
+    }
+
+    pub fn state(&self) -> crate::control_plane::lifecycle::State {
+        self.execution.state
     }
 }
 
@@ -572,7 +590,20 @@ impl FleetTree {
         }
 
         // Phase 2: ordinary pane rows for panes no agent row claimed. Each
-        // pane record appears at most once (first record wins).
+        // pane record appears at most once (first record wins). A pane that hosts
+        // an execution Radar tracks is that execution's row: one row per pane, and
+        // no separate plain-pane row beside it.
+        let mut by_pane: HashMap<&str, &crate::model::ExecutionObservation> = HashMap::new();
+        for execution in &inventory.executions {
+            if let Some(pane) = execution
+                .placement
+                .as_ref()
+                .and_then(|placement| placement.pane())
+            {
+                by_pane.entry(pane).or_insert(execution);
+            }
+        }
+        let mut represented: HashSet<&crate::identity::RegistrationId> = HashSet::new();
         let mut pane_seen: HashSet<&str> = HashSet::new();
         for pane in &inventory.panes {
             let pane_id = pane.location.pane_id.as_str();
@@ -582,6 +613,16 @@ impl FleetTree {
             let Some(&root_index) = workspace_index.get(pane.location.workspace_id.as_str()) else {
                 continue; // workspace_id_order covers every pane workspace
             };
+            if let Some(execution) = by_pane.get(pane_id).copied()
+                && !hidden(execution)
+            {
+                represented.insert(&execution.registration_id);
+                roots[root_index].children.push(TreeNode {
+                    row: execution_row(execution, inventory),
+                    children: Vec::new(),
+                });
+                continue;
+            }
             let pane_node = TreeNode {
                 row: TreeRow {
                     id: RowId::Pane(pane_id.to_string()),
@@ -637,29 +678,15 @@ impl FleetTree {
             siblings.push(pane_node);
         }
 
-        let represented: HashSet<&str> = inventory
-            .agents
-            .iter()
-            .filter_map(|agent| agent.registry.managed.as_ref())
-            .map(|subject| subject.subject_id.as_str())
-            .collect();
-        for subject in &inventory.lifecycle_subjects {
-            if subject.state == crate::control_plane::lifecycle::State::Revoked
-                || represented.contains(subject.subject_id.as_str())
-            {
+        // An execution no pane showed is still an execution: a launch that has not
+        // presented, one whose pane this refresh did not report, or one that has
+        // already ended. A subject with no execution produces no row here.
+        for execution in &inventory.executions {
+            if represented.contains(&execution.registration_id) || hidden(execution) {
                 continue;
             }
-            let state = lifecycle_state_label(subject.state);
-            let short_id = &subject.subject_id.as_str()[..8];
-            let title = format!("{state} · subject {short_id}");
             roots.push(TreeNode {
-                row: TreeRow {
-                    id: RowId::Lifecycle(subject.subject_id.clone()),
-                    kind: RowKind::Lifecycle(Box::new(LifecycleRow {
-                        subject: subject.clone(),
-                        title,
-                    })),
-                },
+                row: execution_row(execution, inventory),
                 children: Vec::new(),
             });
         }
@@ -679,6 +706,56 @@ impl FleetTree {
         for node in &mut self.roots {
             attach_node_tasks(node, bus);
         }
+    }
+}
+
+/// Whether an execution is history that the default view hides: revoked before it
+/// ever presented, so it names no process and holds no attachment.
+fn hidden(execution: &crate::model::ExecutionObservation) -> bool {
+    execution.state == crate::control_plane::lifecycle::State::Revoked
+        && execution.process.is_none()
+        && execution.subject_id.is_none()
+}
+
+/// One row for one execution, joined to the attachment it holds or is waiting for.
+fn execution_row(
+    execution: &crate::model::ExecutionObservation,
+    inventory: &crate::model::FleetObservation,
+) -> TreeRow {
+    let state = lifecycle_state_label(execution.state);
+    let who = execution
+        .subject_id
+        .as_ref()
+        .map(|subject| format!("subject {}", &subject.as_str()[..8]))
+        .or_else(|| {
+            execution
+                .placement
+                .as_ref()
+                .and_then(|placement| placement.pane())
+                .map(|pane| format!("pane {pane}"))
+        })
+        .unwrap_or_else(|| format!("execution {}", &execution.registration_id.as_str()[..8]));
+    let where_ = execution
+        .placement
+        .as_ref()
+        .and_then(|placement| placement.pane())
+        .and_then(|pane| {
+            inventory
+                .panes
+                .iter()
+                .find(|pane_row| pane_row.location.pane_id.as_str() == pane)
+        })
+        .and_then(|pane| pane.label.clone());
+    let title = match where_ {
+        Some(label) => format!("{state} · {who} · {}", crate::title::display(&label, None)),
+        None => format!("{state} · {who}"),
+    };
+    TreeRow {
+        id: RowId::Lifecycle(execution.registration_id.clone()),
+        kind: RowKind::Lifecycle(Box::new(LifecycleRow {
+            execution: execution.clone(),
+            title,
+        })),
     }
 }
 
@@ -1267,6 +1344,7 @@ mod tests {
             agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
         };
         let mut state = ObservationState::new();
         state.apply_success(observation.clone());
@@ -1359,6 +1437,7 @@ mod tests {
                 pane_container("c2", "wA:p1", None),
             ],
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
         };
         let mut state = ObservationState::new();
         state.apply_success(observation.clone());
@@ -1517,6 +1596,7 @@ mod tests {
             agents,
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
         });
         state
     }
@@ -1777,6 +1857,7 @@ mod tests {
             focus: Default::default(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("mixed".into()),
@@ -1989,61 +2070,84 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_active_lifecycle_subjects_have_logical_rows_without_fake_panes() {
-        use crate::identity::{RegistrationId, SubjectId};
-        const PENDING: &str = "00000000-0000-4000-8000-0000000000a1";
-        const UNJOINED: &str = "00000000-0000-4000-8000-0000000000a2";
+    fn executions_without_a_reported_pane_are_their_own_rows_and_revoked_ones_are_hidden() {
+        use crate::identity::RegistrationId;
+        fn registration(seed: u8) -> RegistrationId {
+            RegistrationId::parse(&format!("00000000-0000-4000-8000-0000000000{seed:02x}"))
+                .expect("a registration id")
+        }
+        let subjectless = crate::model::ExecutionObservation {
+            registration_id: registration(0xa1),
+            state: crate::control_plane::lifecycle::State::Pending,
+            origin: crate::model::ExecutionOrigin::Spawned,
+            placement: None,
+            subject_id: None,
+            claim_id: None,
+            reserved_claim_id: Some(crate::identity::ClaimId::random()),
+            process: None,
+            bound_registration_id: None,
+            session: None,
+            ended: false,
+        };
+        let attached = crate::model::ExecutionObservation {
+            registration_id: registration(0xa2),
+            state: crate::control_plane::lifecycle::State::Bound,
+            origin: crate::model::ExecutionOrigin::Spawned,
+            placement: None,
+            subject_id: Some(
+                crate::identity::SubjectId::parse("00000000-0000-4000-8000-0000000000b2")
+                    .expect("a subject id"),
+            ),
+            claim_id: Some(crate::identity::ClaimId::random()),
+            reserved_claim_id: None,
+            process: Some(crate::model::ProcessIdentity {
+                boot_id: "boot".into(),
+                pid: 42,
+                start_ticks: 7,
+            }),
+            bound_registration_id: None,
+            session: Some("session".into()),
+            ended: false,
+        };
+        // Revoked before it ever presented: no process, no attachment, no row.
+        let revoked = crate::model::ExecutionObservation {
+            registration_id: registration(0xa3),
+            state: crate::control_plane::lifecycle::State::Revoked,
+            origin: crate::model::ExecutionOrigin::Spawned,
+            placement: None,
+            subject_id: None,
+            claim_id: None,
+            reserved_claim_id: None,
+            process: None,
+            bound_registration_id: None,
+            session: None,
+            ended: false,
+        };
         let observation = FleetObservation {
-            lifecycle_subjects: vec![
-                LifecycleObservation {
-                    subject_id: SubjectId::parse(PENDING).expect("a subject id"),
-                    bound_registration_id: None,
-                    process: None,
-                    state: crate::control_plane::lifecycle::State::Pending,
-                    session: None,
-                    ended: false,
-                },
-                LifecycleObservation {
-                    subject_id: SubjectId::parse(UNJOINED).expect("a subject id"),
-                    bound_registration_id: RegistrationId::parse(
-                        "00000000-0000-4000-8000-0000000000e1",
-                    ),
-                    process: Some(crate::model::ProcessIdentity {
-                        boot_id: "boot".into(),
-                        pid: 42,
-                        start_ticks: 7,
-                    }),
-                    state: crate::control_plane::lifecycle::State::Bound,
-                    session: None,
-                    ended: false,
-                },
-                LifecycleObservation {
-                    subject_id: SubjectId::parse("00000000-0000-4000-8000-0000000000a3")
-                        .expect("a subject id"),
-                    bound_registration_id: None,
-                    process: None,
-                    state: crate::control_plane::lifecycle::State::Revoked,
-                    session: None,
-                    ended: false,
-                },
-            ],
+            executions: vec![subjectless.clone(), attached.clone(), revoked],
             ..FleetObservation::default()
         };
         let mut state = ObservationState::new();
         state.apply_success(observation);
-        let tree = FleetTree::build(&state);
-        let rows = flatten(&tree);
-        assert_eq!(rows.len(), 2);
+        let rows = flatten(&FleetTree::build(&state));
+        assert_eq!(
+            rows.len(),
+            2,
+            "a revoked execution that never presented is hidden"
+        );
         assert_eq!(
             rows[0].1,
-            RowId::Lifecycle(SubjectId::parse(PENDING).expect("subject id"))
+            RowId::Lifecycle(subjectless.registration_id.clone()),
+            "an execution keyed by its registration, not by a subject it has not earned"
         );
-        assert!(rows[0].2.contains("pending"));
+        assert!(rows[0].2.contains("pending"), "{}", rows[0].2);
         assert_eq!(
             rows[1].1,
-            RowId::Lifecycle(SubjectId::parse(UNJOINED).expect("subject id"))
+            RowId::Lifecycle(attached.registration_id.clone())
         );
-        assert!(rows[1].2.contains("unresolved"));
-        assert!(rows.iter().all(|(_, id, _)| !matches!(id, RowId::Pane(_))));
+        assert!(
+            !rows.iter().any(|(_, id, _)| matches!(id, RowId::Pane(_))),
+            "no pane is invented for an execution no pane reported"
+        );
     }
 }

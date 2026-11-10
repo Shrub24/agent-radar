@@ -1238,7 +1238,7 @@ impl App {
                 RowKind::Lifecycle(row) => {
                     command
                         && matches!(
-                            row.subject.state,
+                            row.state(),
                             crate::control_plane::lifecycle::State::Pending
                                 | crate::control_plane::lifecycle::State::Captured
                         )
@@ -2268,6 +2268,7 @@ mod tests {
             focus: Default::default(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
             workspaces: vec![],
             tabs: vec![],
             panes: vec![],
@@ -2289,6 +2290,7 @@ mod tests {
             focus: Default::default(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+            executions: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -2460,6 +2462,7 @@ mod tests {
             focus: Default::default(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
+        executions: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),

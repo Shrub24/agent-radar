@@ -38,10 +38,14 @@ a subject should introduce another default-view row for the same execution.
 - Derive subject grant/reservation/history lookup from authoritative claims, not
   writable subject authority pointers. Update indexes during transitions and
   rebuild on startup; remove admission-time process reconciliation.
-- Unify exact claim release and registration finalisation for shutdown, verified
-  process exit and launch failure. Fail a mismatched restart/continuation visibly
-  in the TUI, settle its reservation and apply normal rules to the actual session,
-  without automatic retry or clearing another registration's reservation.
+- Keep session shutdown as normal exact-claim release. Use the existing shared
+  supervisor's authenticated completion as the primary process-exit signal and
+  main fallback release, with wake/sweep verified exits and launch failure entering
+  the same registration finalisation. Do not wait for pane death to settle a
+  completed execution or equate finalisation with pane removal. Fail a mismatched
+  restart/continuation visibly in the TUI, settle its reservation and apply normal
+  rules to the actual session, without automatic retry or clearing another
+  registration's reservation.
 - Store attachment facts on claims and process facts on executions; compose reads
   instead of synchronising execution copies into claims.
 - Make registrations the row unit in the default view. Join each execution with

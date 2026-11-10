@@ -461,6 +461,10 @@ fn collect(
         .as_ref()
         .map(|read| read.containers.clone())
         .unwrap_or_default();
+    let executions = registry
+        .as_ref()
+        .map(|read| read.executions.clone())
+        .unwrap_or_default();
     let lifecycle_subjects = registry
         .as_ref()
         .map(|read| {
@@ -484,6 +488,7 @@ fn collect(
     });
     observation.containers = containers;
     observation.lifecycle_subjects = lifecycle_subjects;
+    observation.executions = executions;
     stamp_assignment_ages(&mut observation);
     RefreshOutcome::Success {
         observation: Box::new(observation),
@@ -570,6 +575,7 @@ mod tests {
                 focus: Default::default(),
                 containers: Vec::new(),
                 lifecycle_subjects: Vec::new(),
+                executions: Vec::new(),
                 workspaces: Vec::new(),
                 tabs: Vec::new(),
                 panes: Vec::new(),

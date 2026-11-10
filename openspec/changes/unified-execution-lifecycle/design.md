@@ -218,12 +218,24 @@ grant enforce these relational rules once under the transition owner.
 
 ### 10. Claim release and registration finalisation are shared transitions
 
-Session shutdown is the normal exact-claim release path. Verified process exit is
-the non-graceful fallback: record execution end and settle every outstanding claim
-on that registration through the same claim transition. A failed launch enters
-shared explicit registration finalisation, including reserved/pending claim
-cleanup and verified launch-owned resource cleanup. Keep execution and attachment
-history. Do not use Rust Drop for fallible durable work or external effects.
+Session shutdown is the normal exact-claim release path. Both daemon-created
+`radar run --launch` and operator-run `radar run [--agent] -- CMD` already use the
+same supervisor; their admission proof differs, not their supervision. Its
+authenticated completion report is the primary process-exit signal and the main
+fallback when session shutdown did not release the claim. Record execution end
+and code/signal, then settle every outstanding claim on that registration through
+the shared release transition, without waiting for a tmux wake or sweep.
+
+Keep the existing tmux wake and process sweep as fallback observations; neither
+pane death alone nor an unverified observation proves program exit. When either
+establishes verified exit it enters the same registration finalisation. A later
+completion may add missing code/signal without repeating settled cleanup, and
+completion after session shutdown is an idempotent release no-op. Failed-launch
+withdrawal also uses that finalisation, including reserved/pending claim cleanup
+and applicable verified launch-owned resource cleanup. Finalisation alone does
+not authorise pane removal: spontaneous completion retains terminal output or
+returns to the operator's shell; explicit close owns removal. Keep execution and
+attachment history. Do not use Rust Drop for fallible durable work or effects.
 
 Remove admission-time release_if_gone and opportunistic process observation to
 repair claim ownership. Observation updates execution/claim state through its
@@ -269,7 +281,8 @@ exclusion conflict and must not be cancelled by this operation.
 
 Settled operational choices: hide revoked never-presented executions; accept the
 one-time row-key selection/fold reset; keep the unreleased Radar 0.12.0 and
-pi-radar 0.16.0 versions while advancing the changed wire to 19. Unsupported alpha
+pi-radar 0.16.0 versions. S2 already advanced presence to wire 19; advance the
+changed observation document to wire 20. Unsupported alpha
 state is reset, not migrated. Restart already passes its prepared execution to
 spawn dispatch in the checkpoint; verify that invariant through rework rather
 than introducing another execution reservation.

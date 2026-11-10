@@ -2,7 +2,7 @@ use agent_radar::{
     app::App,
     config::Config,
     control_plane::lifecycle::State as LifecycleState,
-    model::{AgentState, FleetObservation, LifecycleObservation},
+    model::{AgentState, ExecutionObservation, ExecutionOrigin, FleetObservation},
     observation::ObservationState,
     theme, ui,
 };
@@ -45,13 +45,20 @@ unknown = "diamond"
         }
     }
 
-    let subject_id = agent_radar::identity::SubjectId::random();
+    // A launch that has not presented is an execution with no attachment yet, and
+    // its row still animates because the daemon is still waiting on it.
     let mut observation = FleetObservation::default();
-    observation.lifecycle_subjects.push(LifecycleObservation {
-        subject_id: subject_id.clone(),
-        bound_registration_id: None,
-        process: None,
+    let registration = agent_radar::identity::RegistrationId::random();
+    observation.executions.push(ExecutionObservation {
+        registration_id: registration.clone(),
         state: LifecycleState::Pending,
+        origin: ExecutionOrigin::Spawned,
+        placement: None,
+        subject_id: None,
+        claim_id: None,
+        reserved_claim_id: None,
+        process: None,
+        bound_registration_id: None,
         session: None,
         ended: false,
     });
@@ -77,10 +84,12 @@ unknown = "diamond"
         })
         .collect::<Vec<_>>()
         .join("\\n");
+    // The row names the execution it is: no subject exists yet, so it is titled by
+    // the registration the daemon issued.
     let loading = theme::frame(theme::command_frames().expect("configured frames"), 0);
     assert!(rendered.contains(&format!(
-        "{loading} pending · subject {}",
-        &subject_id.as_str()[..8]
+        "{loading} pending · execution {}",
+        &registration.as_str()[..8]
     )));
 
     for (state, mark) in [

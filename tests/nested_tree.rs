@@ -110,6 +110,7 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
         focus: Default::default(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
+        executions: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wH".into(),
             label: Some("home".into()),
@@ -1844,6 +1845,7 @@ fn wa_inventory(pane_ids: &[&str]) -> FleetObservation {
         focus: Default::default(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
+        executions: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: Some("alpha".into()),

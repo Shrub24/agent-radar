@@ -781,6 +781,10 @@ export type Kind = "workspace" | "tab" | "pane";
  */
 export type Provenance = "created" | "observed";
 /**
+ * How an execution came to be tracked.
+ */
+export type ExecutionOrigin = "spawned" | "enrolled" | "admitted";
+/**
  * Where the unified operator's tmux client is looking, read with the inventory
  * so the two describe one moment.
  *
@@ -1192,6 +1196,12 @@ export interface FleetObservation {
    * container was read — not that none exists.
    */
   containers?: PublicContainer[];
+  /**
+   * Every execution this daemon records, whether or not a session has attached
+   * it yet. A row is one execution joined to its optional attachment, so a
+   * launch in flight is published here before it presents.
+   */
+  executions?: ExecutionObservation[];
   focus?: Focus;
   /**
    * Public lifecycle records from the same daemon read as agent facts. The
@@ -1670,6 +1680,56 @@ export interface Binding2 {
    * reusing it, so a binding that names no incarnation is never verified.
    */
   incarnation: ProcessIdentity3 | null;
+}
+/**
+ * One execution: a process incarnation and what it is doing, joined to the
+ * attachment it holds or is about to hold.
+ *
+ * Identity is the registration. The claim references are separate because they
+ * answer different questions: `claim_id` is the attachment that holds the subject
+ * now, `reserved_claim_id` is the exclusive entitlement waiting for a process that
+ * has not presented. Neither is derived from the other, and a row shows both
+ * without pretending one is the other.
+ */
+export interface ExecutionObservation {
+  bound_registration_id?: string | null;
+  claim_id?: string | null;
+  /**
+   * Whether the daemon recorded this execution's process as ended.
+   */
+  ended: boolean;
+  origin: ExecutionOrigin;
+  /**
+   * Where this execution runs, as the daemon recorded it when it verified the
+   * pane. A pane is joined to its row by this, and only this.
+   */
+  placement?: Placement | null;
+  /**
+   * The identity the daemon verified for this execution's process, once it has
+   * one. A launch that has not presented has none, and its row says so.
+   */
+  process?: ProcessIdentity3 | null;
+  registration_id: string;
+  reserved_claim_id?: string | null;
+  /**
+   * The session its attachment carries, when one is attached.
+   */
+  session?: string | null;
+  state: State;
+  subject_id?: string | null;
+}
+/**
+ * Where one execution runs, and the backend generation that was serving when
+ * its placement was established.
+ *
+ * A pane id outlives the server that answered for it, so the location alone is
+ * not authority: an operation that would remove the pane compares
+ * `instance` against the backend serving now, and a placement recorded without
+ * one removes nothing.
+ */
+export interface Placement {
+  instance?: ProcessIdentity3 | null;
+  location: RegistryLocation;
 }
 /**
  * Public lifecycle identity carried into the display projection.

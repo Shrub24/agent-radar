@@ -35,6 +35,7 @@ pub(crate) fn read(
         agents: agents(registry, now_ms)?,
         topology: topology(registry, inventory)?,
         lifecycle: lifecycle(registry)?,
+        executions: executions(registry)?,
         containers: containers_of(registry)?,
     })
 }
@@ -238,6 +239,85 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
         }
         after = Some(next_cursor(after, last, "lifecycle subject")?);
     }
+}
+
+/// Every execution this daemon records, joined to the attachment it holds or is
+/// about to hold.
+///
+/// Read from the execution records themselves, so an execution that has not been
+/// attached — a launch in flight, a recipe launch with no spawn edge — is
+/// published too. The attachment references are resolved from the claim records:
+/// a grant and a reservation are separate questions with separate answers.
+fn executions(registry: &Registry) -> Result<Vec<crate::model::ExecutionObservation>, String> {
+    use crate::control_plane::events::Standing;
+    let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    // One pass over the claims resolves, per subject, the grant that holds it, the
+    // reservation waiting for it, and the session it carries.
+    #[derive(Default)]
+    struct Attachment {
+        grant: Option<crate::identity::ClaimId>,
+        reservation: Option<crate::identity::ClaimId>,
+        session: Option<String>,
+    }
+    let mut subjects: std::collections::BTreeMap<crate::identity::SubjectId, Attachment> =
+        std::collections::BTreeMap::new();
+    let mut owners: std::collections::BTreeMap<
+        crate::identity::RegistrationId,
+        crate::identity::SubjectId,
+    > = std::collections::BTreeMap::new();
+    for claim in log.ids() {
+        let Some(facts) = log.facts(claim) else {
+            continue;
+        };
+        let Some(subject) = facts.subject_id.clone() else {
+            continue;
+        };
+        owners.insert(facts.registration_id.clone(), subject.clone());
+        let entry = subjects.entry(subject).or_default();
+        match facts.standing {
+            Standing::Reserved if entry.reservation.is_none() => {
+                entry.reservation = Some(claim.clone())
+            }
+            _ if facts.standing.grants_authority() && entry.grant.is_none() => {
+                entry.grant = Some(claim.clone());
+                entry.session = facts.session.clone();
+            }
+            _ => {}
+        }
+    }
+    let mut published = Vec::new();
+    for (registration_id, execution) in log.processes() {
+        let subject_id = owners.get(registration_id).cloned();
+        let attachment = subject_id
+            .as_ref()
+            .and_then(|subject| subjects.get(subject));
+        published.push(crate::model::ExecutionObservation {
+            registration_id: registration_id.clone(),
+            state: execution.state,
+            origin: match execution.origin {
+                crate::control_plane::lifecycle::Origin::Spawned => {
+                    crate::model::ExecutionOrigin::Spawned
+                }
+                crate::control_plane::lifecycle::Origin::Enrolled => {
+                    crate::model::ExecutionOrigin::Enrolled
+                }
+                crate::control_plane::lifecycle::Origin::Admitted => {
+                    crate::model::ExecutionOrigin::Admitted
+                }
+            },
+            placement: execution.placement.clone(),
+            subject_id,
+            claim_id: attachment.and_then(|attachment| attachment.grant.clone()),
+            reserved_claim_id: attachment.and_then(|attachment| attachment.reservation.clone()),
+            process: execution.process.clone(),
+            bound_registration_id: execution.bound_registration_id.clone(),
+            session: attachment.and_then(|attachment| attachment.session.clone()),
+            ended: execution.exited_at.is_some()
+                || execution.ended_externally_at.is_some()
+                || execution.completion.is_some(),
+        });
+    }
+    Ok(published)
 }
 
 /// Every container the daemon records, read to the end of its pages.

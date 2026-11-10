@@ -350,6 +350,7 @@ fn inventory(pane_ids: &[&str], agents: Vec<AgentObservation>) -> FleetObservati
         focus: Default::default(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
+        executions: Vec::new(),
         workspaces: vec![],
         tabs: vec![],
         panes: pane_ids

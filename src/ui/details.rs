@@ -755,22 +755,37 @@ pub(super) fn overview_lines(
             activity_lines(&agent.facts, blocks, page);
         }
         RowKind::Lifecycle(lifecycle) => {
-            let subject = &lifecycle.subject;
-            page.push(field("kind", "unjoined lifecycle subject".to_string()));
-            page.push(field("subject", subject.subject_id.to_string()));
+            let execution = &lifecycle.execution;
+            page.push(field(
+                "kind",
+                if lifecycle.unjoined() {
+                    "unjoined lifecycle execution".to_string()
+                } else {
+                    "lifecycle execution".to_string()
+                },
+            ));
+            page.push(field("registration", execution.registration_id.to_string()));
+            page.push(field(
+                "subject",
+                execution
+                    .subject_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "not attached".to_string()),
+            ));
             page.push(field(
                 "state",
-                format!("{:?}", subject.state).to_lowercase(),
+                format!("{:?}", execution.state).to_lowercase(),
             ));
             page.push(field(
-                "binding",
-                subject
-                    .bound_registration_id
-                    .as_ref()
-                    .map(|agent| format!("unresolved registration {agent}"))
-                    .unwrap_or_else(|| "awaiting registration".to_string()),
+                "attachment",
+                match (&execution.claim_id, &execution.reserved_claim_id) {
+                    (Some(claim), _) => format!("granted {claim}"),
+                    (None, Some(reserved)) => format!("reserved {reserved}"),
+                    (None, None) => "none".to_string(),
+                },
             ));
-            if let Some(process) = &subject.process {
+            if let Some(process) = &execution.process {
                 page.push(field("captured pid", process.pid.to_string()));
                 page.push(field(
                     "process start ticks",
@@ -781,7 +796,7 @@ pub(super) fn overview_lines(
             }
             page.push(field(
                 "session",
-                subject.session.clone().unwrap_or_else(unavailable),
+                execution.session.clone().unwrap_or_else(unavailable),
             ));
         }
         RowKind::Task(task) => {
@@ -1054,7 +1069,7 @@ pub(super) fn process_lines(
             page.push(field(
                 "process evidence",
                 lifecycle
-                    .subject
+                    .execution
                     .process
                     .as_ref()
                     .map(|process| format!("captured pid {}", process.pid))

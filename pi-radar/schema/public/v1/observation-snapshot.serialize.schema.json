@@ -454,6 +454,106 @@
       ],
       "type": "object"
     },
+    "ExecutionObservation": {
+      "additionalProperties": false,
+      "description": "One execution: a process incarnation and what it is doing, joined to the\nattachment it holds or is about to hold.\n\nIdentity is the registration. The claim references are separate because they\nanswer different questions: `claim_id` is the attachment that holds the subject\nnow, `reserved_claim_id` is the exclusive entitlement waiting for a process that\nhas not presented. Neither is derived from the other, and a row shows both\nwithout pretending one is the other.",
+      "properties": {
+        "bound_registration_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "claim_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ended": {
+          "default": false,
+          "description": "Whether the daemon recorded this execution's process as ended.",
+          "type": "boolean"
+        },
+        "origin": {
+          "$ref": "#/$defs/ExecutionOrigin"
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Placement"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where this execution runs, as the daemon recorded it when it verified the\npane. A pane is joined to its row by this, and only this."
+        },
+        "process": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The identity the daemon verified for this execution's process, once it has\none. A launch that has not presented has none, and its row says so."
+        },
+        "registration_id": {
+          "type": "string"
+        },
+        "reserved_claim_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "description": "The session its attachment carries, when one is attached.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        },
+        "subject_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "registration_id",
+        "state",
+        "origin",
+        "ended"
+      ],
+      "type": "object"
+    },
+    "ExecutionOrigin": {
+      "description": "How an execution came to be tracked.",
+      "oneOf": [
+        {
+          "const": "spawned",
+          "description": "Radar started it.",
+          "type": "string"
+        },
+        {
+          "const": "enrolled",
+          "description": "An already-running process reported itself.",
+          "type": "string"
+        },
+        {
+          "const": "admitted",
+          "description": "A program Radar admitted in place.",
+          "type": "string"
+        }
+      ]
+    },
     "FactsSnapshot": {
       "additionalProperties": false,
       "description": "The agent's own process facts. Self-authored by any Pi session, with no owner\nor assignment, and kept separate from execution and assignment. Every field\nis optional and a published snapshot replaces the whole value, so omission\nwithdraws a fact. `context_window` is counts; a display derives the percentage.",
@@ -525,6 +625,13 @@
           "description": "The containers this daemon records, read beside the registry facts. A\nbackend's inventory never carries them, and an empty list means no\ncontainer was read — not that none exists.",
           "items": {
             "$ref": "#/$defs/PublicContainer"
+          },
+          "type": "array"
+        },
+        "executions": {
+          "description": "Every execution this daemon records, whether or not a session has attached\nit yet. A row is one execution joined to its optional attachment, so a\nlaunch in flight is published here before it presents.",
+          "items": {
+            "$ref": "#/$defs/ExecutionObservation"
           },
           "type": "array"
         },
@@ -1354,6 +1461,29 @@
         "location",
         "label",
         "title"
+      ],
+      "type": "object"
+    },
+    "Placement": {
+      "additionalProperties": false,
+      "description": "Where one execution runs, and the backend generation that was serving when\nits placement was established.\n\nA pane id outlives the server that answered for it, so the location alone is\nnot authority: an operation that would remove the pane compares\n`instance` against the backend serving now, and a placement recorded without\none removes nothing.",
+      "properties": {
+        "instance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "location": {
+          "$ref": "#/$defs/RegistryLocation"
+        }
+      },
+      "required": [
+        "location"
       ],
       "type": "object"
     },
