@@ -2047,14 +2047,15 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
             json!({"backend": "tmux", "pane": format!("tmux:{}:{pane}", server.name)});
         report["registration_id"] = json!(agent);
         report["session_id"] = json!(session);
-        let claim_id = random_uuid();
-        report["claim_id"] = json!(claim_id);
         let granted = client.call("agent.presence", report.clone());
         assert_eq!(
             granted["result"]["standing"], "granted",
             "{granted}; {report}"
         );
-        claim_id
+        granted["result"]["claim_id"]
+            .as_str()
+            .expect("claim id")
+            .to_owned()
     };
     let (parent_subject, parent_agent, parent_pane) =
         spawned_live_tmux_child(&mut client, &state, &root, &root_session, Value::Null);
@@ -2275,11 +2276,12 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
             json!({"backend": "tmux", "pane": format!("tmux:{}:{pane}", server.name)});
         report["registration_id"] = json!(agent);
         report["session_id"] = json!(session);
-        let claim_id = random_uuid();
-        report["claim_id"] = json!(claim_id);
         let granted = client.call("agent.presence", report);
         assert_eq!(granted["result"]["standing"], "granted", "{granted}");
-        claim_id
+        granted["result"]["claim_id"]
+            .as_str()
+            .expect("claim id")
+            .to_owned()
     };
     let (parent_subject, parent_agent, parent_pane) =
         spawned_live_tmux_child(&mut client, &state, &root, &root_session, Value::Null);
@@ -2751,8 +2753,7 @@ fn registry_socket_rejects_unknown_fields_and_surfaces_corrupt_records() {
         json!({
             "registration_id":id, "source":"test-publisher",
             "incarnation":"8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
-            "session_id":"6d1e2f30-4a5b-4c6d-8e7f-8091a2b3c4d5",
-            "claim_id":random_uuid()
+            "session_id":"6d1e2f30-4a5b-4c6d-8e7f-8091a2b3c4d5"
         }),
     );
     assert_eq!(error_code(&corrupt), "refused", "{corrupt}");
@@ -12534,17 +12535,19 @@ fn presence_lead(
     pane: &str,
     session: &str,
 ) -> (String, Attempt) {
-    let claim = random_uuid();
     let answer = client.call(
         "agent.presence",
         json!({
             "source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
             "process":lead.identity.clone(), "session_id":session,
-            "claim_id":claim,
             "location":{"backend":"tmux", "pane":pane}
         }),
     );
     assert_eq!(answer["result"]["standing"], "granted", "{answer}");
+    let claim = answer["result"]["claim_id"]
+        .as_str()
+        .expect("claim ID")
+        .to_owned();
     (
         answer["result"]["registration_id"]
             .as_str()
@@ -12568,6 +12571,87 @@ fn presence_lead(
 }
 
 #[test]
+fn a_claimless_report_recovers_the_attachment_it_already_made() {
+    let sandbox = Sandbox::new("presence-recover");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon = Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend))
+        .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let report = json!({"source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
+        "process":lead.identity,"session_id":TRACKED_SESSION,
+        "location":{"backend":"tmux","pane":"wA:p1"}});
+    let first = client.call("agent.presence", report.clone());
+    assert_eq!(first["result"]["standing"], "granted", "{first}");
+    // The reply was lost, so the client reports again naming nothing. It gets the
+    // attachment it already has rather than a second one.
+    let retried = client.call("agent.presence", report);
+    assert_eq!(retried["result"]["standing"], "granted", "{retried}");
+    assert_eq!(
+        retried["result"]["claim_id"], first["result"]["claim_id"],
+        "a retried report made a second attachment"
+    );
+    assert_eq!(
+        retried["result"]["subject_id"], first["result"]["subject_id"],
+        "{retried}"
+    );
+    let subjects = client.call("lifecycle.list", json!({}));
+    assert_eq!(
+        subjects["result"]["subjects"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        1,
+        "{subjects}"
+    );
+    daemon.stop();
+    lead.kill();
+}
+
+#[test]
+fn a_claimless_report_for_another_session_is_refused_rather_than_replacing_the_claim() {
+    let sandbox = Sandbox::new("presence-other-session");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon = Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend))
+        .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let report = json!({"source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
+        "process":lead.identity,"session_id":TRACKED_SESSION,
+        "location":{"backend":"tmux","pane":"wA:p1"}});
+    let held = client.call("agent.presence", report.clone());
+    assert_eq!(held["result"]["standing"], "granted", "{held}");
+    // Session shutdown precedes the next start, so a report for a different
+    // session without a release is a caller fault, not a switch to make for it.
+    let mut other = report;
+    other["session_id"] = json!(random_uuid());
+    let refused = client.call("agent.presence", other);
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+    let current = client.call(
+        "lifecycle.get",
+        json!({"subject_id": held["result"]["subject_id"]}),
+    );
+    assert_eq!(
+        current["result"]["subject"]["claim_id"], held["result"]["claim_id"],
+        "the incumbent lost its claim to a report that was refused"
+    );
+    daemon.stop();
+    lead.kill();
+}
+
+#[test]
 fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant() {
     let sandbox = Sandbox::new("presence-claims");
     let lead = LeadProcess::start();
@@ -12582,12 +12666,14 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
     let mut daemon = Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend))
         .expect("daemon");
     let mut client = Client::dial(daemon.path());
-    let claim = random_uuid();
     let report = json!({"source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
-        "process":lead.identity,"session_id":TRACKED_SESSION,"claim_id":claim,
+        "process":lead.identity,"session_id":TRACKED_SESSION,
         "location":{"backend":"tmux","pane":"wA:p1"}});
     let first = client.call("agent.presence", report.clone());
     assert_eq!(first["result"]["standing"], "granted", "{first}");
+    let claim: Value = first["result"]["claim_id"].clone();
+    let mut report = report;
+    report["claim_id"] = claim.clone();
     let registration = first["result"]["registration_id"].clone();
     let subject = first["result"]["subject_id"].clone();
     let mut reassert = report.clone();
@@ -12612,9 +12698,8 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
     let mut forged = reassert.clone();
     forged["subject_id"] = json!(random_uuid());
     assert!(client.call("agent.presence", forged)["error"].is_object());
-    let duplicate_claim = random_uuid();
     let rejected_report = json!({"source":"herdsman-pi","incarnation":CHILD_INCARNATION,
-        "process":duplicate.identity,"session_id":TRACKED_SESSION,"claim_id":duplicate_claim,
+        "process":duplicate.identity,"session_id":TRACKED_SESSION,
         "location":{"backend":"tmux","pane":"wA:p1"}});
     let rejected = client.call("agent.presence", rejected_report.clone());
     assert_eq!(rejected["result"]["standing"], "duplicate", "{rejected}");
@@ -12644,18 +12729,21 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
         "released claim retained inbox access: {inbox}"
     );
     assert_eq!(
-        client.call("agent.presence", report.clone())["result"]["standing"],
-        "released"
+        error_code(&client.call("agent.presence", report.clone())),
+        "refused",
+        "a released claim cannot be reopened by naming it"
     );
     assert_eq!(
         client.call("agent.presence", rejected_report.clone())["result"]["standing"],
-        "duplicate"
+        "pending",
+        "the released session is free, so a later attempt waits rather than duplicating"
     );
     let mut fresh = report.clone();
-    fresh["claim_id"] = json!(random_uuid());
+    fresh.as_object_mut().expect("report").remove("claim_id");
     let granted = client.call("agent.presence", fresh.clone());
     assert_eq!(granted["result"]["standing"], "granted", "{granted}");
     assert_eq!(granted["result"]["subject_id"], subject);
+    fresh["claim_id"] = granted["result"]["claim_id"].clone();
     let active = client.call("lifecycle.get", json!({"subject_id": subject}));
     assert_eq!(
         active["result"]["subject"]["claim_id"], fresh["claim_id"],
@@ -12690,7 +12778,8 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
     );
     assert_eq!(
         client.call("agent.presence", rejected_report)["result"]["standing"],
-        "duplicate"
+        "pending",
+        "the session is free again, so an unnamed attempt waits for it"
     );
     daemon.stop();
     duplicate.kill();
@@ -12712,16 +12801,19 @@ fn a_fresh_process_reclaims_the_existing_session_subject_after_release_and_resta
         Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(first_backend))
             .expect("daemon");
     let mut client = Client::dial(daemon.path());
-    let old_claim = random_uuid();
     let first = client.call(
         "agent.presence",
         json!({
             "source":"herdsman-pi", "incarnation":random_uuid(), "process":previous.identity,
-            "session_id":TRACKED_SESSION, "claim_id":old_claim,
+            "session_id":TRACKED_SESSION,
             "location":{"backend":"tmux","pane":"wA:p1"}
         }),
     );
     assert_eq!(first["result"]["standing"], "granted", "{first}");
+    let old_claim = first["result"]["claim_id"]
+        .as_str()
+        .expect("claim ID")
+        .to_owned();
     let subject = first["result"]["subject_id"].clone();
     let old_registration = first["result"]["registration_id"].clone();
     let released = client.call(
@@ -12749,7 +12841,7 @@ fn a_fresh_process_reclaims_the_existing_session_subject_after_release_and_resta
         "agent.presence",
         json!({
             "source":"herdsman-pi", "incarnation":random_uuid(), "process":resumed.identity,
-            "session_id":TRACKED_SESSION, "claim_id":random_uuid(),
+            "session_id":TRACKED_SESSION,
             "location":{"backend":"tmux","pane":"wA:p1"}
         }),
     );
@@ -12776,9 +12868,9 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
                 None,
             ))
     };
-    let report = |lead: &LeadProcess, incarnation: &str, session: &str, claim: &str, pane: &str| {
+    let report = |lead: &LeadProcess, incarnation: &str, session: &str, pane: &str| {
         json!({"source":"herdsman-pi", "incarnation":incarnation, "process":lead.identity,
-            "session_id":session, "claim_id":claim, "location":{"backend":"tmux","pane":pane}})
+            "session_id":session, "location":{"backend":"tmux","pane":pane}})
     };
     let other_session = random_uuid();
 
@@ -12794,25 +12886,24 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
     let mut client = Client::dial(daemon.path());
     let held = client.call(
         "agent.presence",
-        report(
-            &switcher,
-            PARENT_INCARNATION,
-            TRACKED_SESSION,
-            &random_uuid(),
-            "wA:p1",
-        ),
+        report(&switcher, PARENT_INCARNATION, TRACKED_SESSION, "wA:p1"),
     );
     assert_eq!(held["result"]["standing"], "granted", "{held}");
     let subject = held["result"]["subject_id"].clone();
+    let registration = held["result"]["registration_id"].clone();
+    // Session shutdown releases the attachment, and only then does the next
+    // session start: the daemon never replaces a claim behind a client's back.
+    let released = client.call(
+        "agent.release",
+        json!({
+            "registration_id": registration, "claim_id": held["result"]["claim_id"],
+            "process": switcher.identity,
+        }),
+    );
+    assert_eq!(released["result"]["standing"], "released", "{released}");
     let switched = client.call(
         "agent.presence",
-        report(
-            &switcher,
-            PARENT_INCARNATION,
-            &other_session,
-            &random_uuid(),
-            "wA:p1",
-        ),
+        report(&switcher, PARENT_INCARNATION, &other_session, "wA:p1"),
     );
     assert_eq!(switched["result"]["standing"], "granted", "{switched}");
     assert_eq!(
@@ -12835,23 +12926,10 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
     let mut client = Client::dial(daemon.path());
     let taken = client.call(
         "agent.presence",
-        report(
-            &incumbent,
-            CHILD_INCARNATION,
-            TRACKED_SESSION,
-            &random_uuid(),
-            "wA:p1",
-        ),
+        report(&incumbent, CHILD_INCARNATION, TRACKED_SESSION, "wA:p1"),
     );
     assert_eq!(taken["result"]["subject_id"], subject, "{taken}");
-    let stale_claim = random_uuid();
-    let stale = report(
-        &duplicate,
-        &random_uuid(),
-        TRACKED_SESSION,
-        &stale_claim,
-        "wA:p2",
-    );
+    let stale = report(&duplicate, &random_uuid(), TRACKED_SESSION, "wA:p2");
     assert_eq!(
         client.call("agent.presence", stale.clone())["result"]["standing"],
         "duplicate"
@@ -12872,16 +12950,13 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
     )
     .expect("daemon");
     let mut client = Client::dial(daemon.path());
-    assert_eq!(
-        client.call("agent.presence", stale.clone())["result"]["standing"],
-        "duplicate"
-    );
-    // A fresh load presents a new claim, and only then takes the subject.
-    let mut fresh = stale;
-    fresh["claim_id"] = json!(random_uuid());
-    let promoted = client.call("agent.presence", fresh);
-    assert_eq!(promoted["result"]["standing"], "granted", "{promoted}");
-    assert_eq!(promoted["result"]["subject_id"], subject, "{promoted}");
+    // The incumbent is gone, so the session is free: a claimless report takes it
+    // and the subject it held comes back with it. Repeating a claim Radar minted
+    // is not how an attachment is renewed — a released or duplicated one is not
+    // promoted by being named again.
+    let resumed = client.call("agent.presence", stale);
+    assert_eq!(resumed["result"]["standing"], "granted", "{resumed}");
+    assert_eq!(resumed["result"]["subject_id"], subject, "{resumed}");
     daemon.stop();
     duplicate.kill();
     switcher.kill();
@@ -13160,13 +13235,27 @@ fn restart_refuses_before_any_signal_when_the_session_context_changes() {
     );
     assert_eq!(error_code(&malformed), "bad_params", "{malformed}");
 
-    // A fresh presence claim switches the same process to a different session.
+    // The same process releases this session and starts another: the restart is
+    // then refused because the lead's recorded session no longer matches.
+    let current = client.call(
+        "lifecycle.get",
+        json!({"subject_id": subject.subject.clone().expect("a presented agent")}),
+    );
+    let released = client.call(
+        "agent.release",
+        json!({
+            "registration_id":agent,
+            "claim_id":current["result"]["subject"]["claim_id"],
+            "process":lead.identity.clone(),
+        }),
+    );
+    assert_eq!(released["result"]["standing"], "released", "{released}");
     let moved = client.call(
         "agent.presence",
         json!({
             "source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
             "registration_id":agent, "process":lead.identity.clone(),
-            "session_id":random_uuid(), "claim_id":random_uuid(),
+            "session_id":random_uuid(),
             "location":{"backend":"tmux", "pane":"wA:p1"}
         }),
     );
@@ -13201,8 +13290,7 @@ fn presence_waits_without_a_current_pane_location() {
         "agent.presence",
         json!({
             "source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
-            "process":lead.identity.clone(), "session_id":TRACKED_SESSION,
-            "claim_id":random_uuid()
+            "process":lead.identity.clone(), "session_id":TRACKED_SESSION
         }),
     );
     assert_eq!(answer["result"]["standing"], "pending", "{answer}");

@@ -22,7 +22,11 @@ pub struct Report {
     pub incarnation: String,
     pub process: crate::model::ProcessIdentity,
     pub session_id: String,
-    pub claim_id: crate::identity::ClaimId,
+    /// The claim Radar returned for this attachment, echoed back on heartbeats and
+    /// reconnects. A first report names none: Radar resolves its own reservation or
+    /// mints the claim, so the client never owns an attachment identity.
+    #[serde(default)]
+    pub claim_id: Option<crate::identity::ClaimId>,
     #[serde(default)]
     pub registration_id: Option<crate::identity::RegistrationId>,
     #[serde(default)]
@@ -218,57 +222,67 @@ pub fn attachment(
 /// Starts or reasserts a presence attempt. Callers serialize presence decisions;
 /// nothing here takes the transition lock, so a launch reservation that already
 /// holds it cannot deadlock.
+///
+/// A report that names its claim resumes that attachment; one that names none
+/// resolves the registration's reservation or discovers its live claim, so a lost
+/// reply costs a retried read rather than a second attachment.
 pub fn begin(
     registry: &Registry,
     registration_id: &RegistrationId,
-    claim_id: &ClaimId,
+    claim_id: Option<&ClaimId>,
     session_id: &str,
     now_ms: i64,
 ) -> Result<Decision, String> {
     validate_registration_id(session_id)?;
-    let execution = lifecycle::adopted_execution(registry, registration_id, now_ms)?;
-    let recorded = decision(registry, claim_id)?;
-    if let Some(existing) = &recorded {
+    if let Some(claim_id) = claim_id {
+        let existing = decision(registry, claim_id)?.ok_or("claim is not recorded")?;
         if &existing.registration_id != registration_id
-            || existing.session_id.as_deref() != Some(session_id)
+            || existing
+                .session_id
+                .as_deref()
+                .is_some_and(|recorded| recorded != session_id)
         {
             return Err("claim ID already identifies a different process or session".into());
         }
-        if let Some(newer) = current(registry, registration_id)?
-            && newer.claim_id != *claim_id
-            && !newer.standing.is_terminal()
-        {
-            let released = release(registry, registration_id, claim_id)?;
-            return Ok(released);
+        if existing.standing.is_terminal() {
+            return Err("a released claim cannot be reopened".into());
         }
-        if matches!(existing.standing, Standing::Reserved) {
-            lifecycle::claim_presence(registry, claim_id, session_id, now_ms)?;
-            return Ok(decision(registry, claim_id)?.unwrap_or_else(|| existing.clone()));
-        }
-        return Ok(existing.clone());
+        return Ok(existing);
     }
-    // A registration that reserved a claim presents on that claim: the identity is
-    // Radar's, not one the client chose.
     if let Some(reserved) = lifecycle::reservation_for(registry, registration_id)? {
         lifecycle::claim_presence(registry, &reserved, session_id, now_ms)?;
         return decision(registry, &reserved)?
             .ok_or_else(|| "the reserved claim was not readable".into());
     }
-    if let Some(previous) = current(registry, registration_id)?
-        && previous.claim_id != *claim_id
-        && !matches!(previous.standing, Standing::Reserved)
+    if let Some(existing) = current(registry, registration_id)?
+        && !existing.standing.is_terminal()
     {
-        release(registry, registration_id, &previous.claim_id)?;
+        if existing
+            .session_id
+            .as_deref()
+            .is_some_and(|recorded| recorded != session_id)
+        {
+            return Err(
+                "the registration already holds a claim for another session; release it first"
+                    .into(),
+            );
+        }
+        if !existing.standing.grants_authority() {
+            lifecycle::claim_presence(registry, &existing.claim_id, session_id, now_ms)?;
+        }
+        return decision(registry, &existing.claim_id)?.ok_or_else(|| "claim disappeared".into());
     }
+    let execution = lifecycle::adopted_execution(registry, registration_id, now_ms)?;
+    let claim_id = ClaimId::random();
     lifecycle::admit_claim(
         registry,
-        claim_id,
+        &claim_id,
         execution,
         session_id,
         Standing::Pending,
         now_ms,
     )?;
-    decision(registry, claim_id)?.ok_or_else(|| "the presence claim was not recorded".into())
+    decision(registry, &claim_id)?.ok_or_else(|| "the presence claim was not recorded".into())
 }
 
 /// Records what a caller decided about a claim it already began.

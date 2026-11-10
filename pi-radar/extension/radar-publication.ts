@@ -961,14 +961,16 @@ type PresenceReporterInput = {
 };
 
 /**
- * Owns this process's durable claim retry state; Radar owns the subject grant.
- * Session-load boundaries create claim IDs; heartbeats/reconnects reuse them.
+ * Owns this process's durable claim retry state; Radar owns the attachment.
+ * Radar mints the claim ID and this reporter persists what it returned, so a
+ * heartbeat or reconnect names it and a lost first reply costs a retried read.
  */
 function createPresenceReporter(input: PresenceReporterInput): RadarPresenceReporter {
 	const { store, client, scheduler, recordName } = input;
 	type State = {
-		version: 2;
-		claim_id: string;
+		version: 3;
+		/** Radar's own attachment identity, once it has answered for this session. */
+		claim_id?: string;
 		session: string;
 		registration_id?: string;
 		subject_id?: string;
@@ -980,9 +982,9 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 	try {
 		const saved = store.read(recordName) as State | undefined;
 		if (
-			saved?.version === 2 &&
-			isUuid(saved.claim_id) &&
+			saved?.version === 3 &&
 			isUuid(saved.session) &&
+			(saved.claim_id === undefined || isUuid(saved.claim_id)) &&
 			Array.isArray(saved.releases)
 		)
 			state = saved;
@@ -1028,11 +1030,13 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 			if (!registration?.process || state !== claim || stopped) return undefined;
 			const answer = await client.presence({
 				...registration, process: registration.process,
-				session_id: claim.session, claim_id: claim.claim_id,
+				session_id: claim.session,
+				...(claim.claim_id ? { claim_id: claim.claim_id } : {}),
 				...(claim.registration_id ? { registration_id: claim.registration_id } : {}),
 				...(claim.subject_id ? { subject_id: claim.subject_id } : {}),
 			});
 			if (state !== claim) return undefined;
+			claim.claim_id = answer.ok ? answer.value.claim_id : claim.claim_id;
 			if (!answer.ok) {
 				if (!["absent", "timeout", "transport"].includes(answer.code)) diagnostic = answer.message;
 				return undefined;
@@ -1062,11 +1066,26 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 	return {
 		report(session) {
 			const releases = [...(state?.releases ?? [])];
-			if (state?.registration_id && !releases.some(release => release.claim_id === state!.claim_id)) {
-				releases.push({ registration_id: state.registration_id, claim_id: state.claim_id });
+			const held = state;
+			// A reload or a reconnect of the same session keeps the attachment Radar
+			// minted; a different session releases the one this process held. An
+			// attachment Radar never answered for has no identity to release yet.
+			const resumed = held?.session === session ? held?.claim_id : undefined;
+			if (
+				resumed === undefined &&
+				held?.registration_id &&
+				held.claim_id &&
+				!releases.some(release => release.claim_id === held.claim_id)
+			) {
+				releases.push({ registration_id: held.registration_id, claim_id: held.claim_id });
 			}
 			standing = undefined;
-			state = { version: 2, session, claim_id: randomUUID(), releases };
+			state = {
+				version: 3,
+				session,
+				...(resumed ? { claim_id: resumed } : {}),
+				releases,
+			};
 			save(); stopped = false;
 			void ensure();
 		},
@@ -1079,11 +1098,18 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 			timer = undefined;
 			if (running) await running;
 			if (state === releasing) standing = undefined;
-			if (releasing?.registration_id && !releasing.releases.some(r => r.claim_id === releasing.claim_id)) {
+			if (
+				releasing?.registration_id &&
+				releasing.claim_id &&
+				!releasing.releases.some(r => r.claim_id === releasing.claim_id)
+			) {
 				releasing.releases.push({ registration_id: releasing.registration_id, claim_id: releasing.claim_id });
 				if (!save()) return;
 			}
 			await releasePending();
+			// The attachment ends here: its identity must not be named again, so a
+			// later report for this session asks Radar for a fresh one.
+			if (state === releasing && state !== undefined) delete state.claim_id;
 		},
 		stop() { stopped = true; if (timer) scheduler.clearTimeout(timer); timer = undefined; },
 		reopen() { stopped = false; void ensure(); },

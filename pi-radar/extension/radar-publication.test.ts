@@ -46,6 +46,7 @@ type Script = Record<string, (params: any, nth: number) => RadarResult<any> | un
 function fakeDaemon(script: Script = {}) {
 	const calls: Call[] = [];
 	const agentIds: string[] = [];
+	const claims: string[] = [];
 	const handles: string[] = [];
 	let minted = 0;
 	const mint = (): string =>
@@ -63,6 +64,8 @@ function fakeDaemon(script: Script = {}) {
 		count(method: string): number {
 			return daemon.all(method).length;
 		},
+		/** The claim ids this daemon minted, in answer order. */
+		claims,
 		client: undefined as unknown as RadarPublicationClient,
 	};
 	daemon.client = {
@@ -77,7 +80,11 @@ function fakeDaemon(script: Script = {}) {
 		presence: async (params) => answer("agent.presence", params, () => {
 			const agentId = params.registration_id ?? agentIds[0] ?? mint();
 			if (!agentIds.includes(agentId)) agentIds.push(agentId);
-			return ok({ registration_id: agentId, claim_id: params.claim_id,
+			// Radar mints the attachment: a report that names none is answered with
+			// the claim it now holds, and a named one is answered with the same id.
+			const claim = params.claim_id ?? mint();
+			if (!claims.includes(claim)) claims.push(claim);
+			return ok({ registration_id: agentId, claim_id: claim,
 				session_id: params.session_id, standing: "granted", subject_id: SESSION_A });
 		}),
 		releasePresence: async (params) => answer("agent.release", params, () => ok({ ...params, standing: "released" })),
@@ -213,15 +220,19 @@ test("managed startup and reload use fresh claims under one launch registration"
 		const binding = await publication.subject();
 		await settle();
 		assert.ok(binding, publication.diagnostic());
-		const initial = daemon.params("agent.presence").claim_id;
-		assert.notEqual(initial, registrationId);
+		// The client owns no attachment identity: it reports the process and the
+		// session, and Radar answers with the claim it minted.
+		assert.equal(daemon.params("agent.presence").claim_id, undefined);
 		assert.equal(daemon.params("agent.presence").registration_id, registrationId);
+		const initial = daemon.claims[0];
+		assert.notEqual(initial, registrationId);
 		await publication.presence.release();
 		assert.equal(daemon.all("agent.release").at(-1).claim_id, initial);
 		publication.presence.report(SESSION_A);
 		await settle();
-		assert.notEqual(daemon.all("agent.presence").at(-1).claim_id, initial);
+		assert.equal(daemon.all("agent.presence").at(-1).claim_id, undefined);
 		assert.equal(daemon.all("agent.presence").at(-1).registration_id, registrationId);
+		assert.notEqual(daemon.claims[1], initial);
 		publication.stop();
 	} finally { cleanup(); }
 });
@@ -426,8 +437,11 @@ test("a reload reuses the process incarnation and its one publisher", async () =
 		assert.equal(radarProcessIncarnation(slot), incarnation);
 		reloaded.execution.update({ activity: "idle" });
 		await settle();
-		// Reload creates a fresh session claim, not another process registration.
-		assert.notEqual(daemon.params("agent.presence", 0).claim_id, daemon.params("agent.presence", 1).claim_id);
+		// A reload of the same session reuses the attachment Radar minted rather
+		// than registering the process again or asking for a second claim.
+		assert.equal(daemon.params("agent.presence", 0).claim_id, undefined);
+		assert.equal(daemon.params("agent.presence", 1).claim_id, daemon.claims[0]);
+		assert.equal(daemon.claims.length, 1);
 		assert.equal(daemon.count("agent.acquire"), 1);
 		assert.equal(daemon.params("agent.publish", 1).sequence, 2);
 		assert.equal(daemon.params("agent.publish", 1).snapshot.activity, "idle");
@@ -571,7 +585,8 @@ test("a lost subject is registered again from the identical content", async () =
 		assert.equal(daemon.count("agent.presence"), 1);
 		await advance(HEARTBEAT_MS);
 		assert.equal(daemon.count("agent.presence"), 2);
-		assert.equal(daemon.params("agent.presence", 0).claim_id, daemon.params("agent.presence", 1).claim_id);
+		assert.equal(daemon.params("agent.presence", 0).claim_id, undefined);
+		assert.equal(daemon.params("agent.presence", 1).claim_id, daemon.claims[0]);
 		assert.deepEqual(daemon.params("agent.presence", 0).process, daemon.params("agent.presence", 1).process);
 		// A new subject cannot carry the old subject's channel state.
 		assert.equal(daemon.params("agent.publish").sequence, 1);
@@ -765,10 +780,12 @@ test("presence retries preserve the claim, fresh session loads replace it, and s
 	const { root, store, cleanup } = makeRoot();
 	const registration = "00000000-0000-4000-8000-000000000123";
 	let mode: "offline" | "granted" | "duplicate" = "offline";
+	const minted: string[] = [];
 	const daemon = fakeDaemon({
 		"agent.presence": params => mode === "offline"
 			? refused("transport", "connection lost")
-			: ok({ registration_id: registration, claim_id: params.claim_id,
+			: ok({ registration_id: registration,
+				claim_id: params.claim_id ?? (minted.push(`00000000-0000-4000-8000-${String(900 + minted.length).padStart(12, "0")}`), minted.at(-1)!),
 				session_id: params.session_id, standing: mode,
 				...(mode === "granted" ? { subject_id: SESSION_A } : {}) }),
 	});
@@ -780,7 +797,7 @@ test("presence retries preserve the claim, fresh session loads replace it, and s
 			location: async () => ({ state: "resolved", location: { backend: "tmux", pane } }),
 		});
 		await settle();
-		const firstClaim = daemon.params("agent.presence").claim_id;
+		const firstClaim = minted[0];
 		mode = "granted";
 		await advance(HEARTBEAT_MS);
 		assert.equal(daemon.params("agent.presence", 1).claim_id, firstClaim);
@@ -791,7 +808,7 @@ test("presence retries preserve the claim, fresh session loads replace it, and s
 		mode = "duplicate";
 		publication.presence.report(SESSION_B);
 		await settle();
-		const duplicateClaim = daemon.all("agent.presence").at(-1).claim_id;
+		const duplicateClaim = minted.at(-1)!;
 		assert.notEqual(duplicateClaim, firstClaim);
 		assert.equal((await publication.subject())?.subject_id, undefined);
 		assert.match(publication.presence.diagnostic() ?? "", /reload or resume/);

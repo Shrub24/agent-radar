@@ -68,9 +68,15 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "description": "One presence report. Identity is the process's own, never a caller's choice.",
   "properties": {
     "claim_id": {
-      "type": "string"
+      "default": null,
+      "description": "The claim Radar returned for this attachment, echoed back on heartbeats and\nreconnects. A first report names none: Radar resolves its own reservation or\nmints the claim, so the client never owns an attachment identity.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "incarnation": {
       "type": "string"

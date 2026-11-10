@@ -220,14 +220,17 @@ export function createRadarExecutionAdapter(
 		if (typeof disposer === "function")
 			disposers.push(disposer as () => void);
 	};
+	// Pi awaits what a handler returns, so the lifecycle boundary's own promise has
+	// to reach it: session shutdown is where the attachment is released, and a
+	// discarded promise lets the next session start before the release landed.
 	const on = (
 		name: string,
-		handler: (event: any, context: any) => void,
+		handler: (event: any, context: any) => unknown,
 	): void => {
 		keep(
-			pi.on(name, (event, context) => {
-				if (!stopped) handler(event, context);
-			}),
+			pi.on(name, (event, context) =>
+				stopped ? undefined : handler(event, context),
+			),
 		);
 	};
 

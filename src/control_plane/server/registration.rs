@@ -45,11 +45,10 @@ pub(super) fn presence_request(
         }
         let registration = presence::registration(&registry, &report, now)?;
         let registration_id = registration.registration_id.clone();
-        let claim_id = report.claim_id.clone();
         let mut claim = presence::begin(
             &registry,
             &registration_id,
-            &claim_id,
+            report.claim_id.as_ref(),
             &report.session_id,
             now,
         )?;
@@ -98,7 +97,7 @@ pub(super) fn presence_request(
         claim = presence::begin(
             &registry,
             &registration_id,
-            &claim_id,
+            Some(&claim.claim_id),
             &report.session_id,
             now,
         )?;

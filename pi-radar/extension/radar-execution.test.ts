@@ -37,6 +37,9 @@ function harness(
 		slot?: RadarProcessSlot;
 		root?: string;
 		scheduler?: RadarScheduler;
+		/** Holds a release open, so a test can see whether the boundary awaited it. */
+		slowRelease?: () => Promise<void>;
+		order?: string[];
 	} = {},
 ) {
 	const handlers = new Map<
@@ -48,6 +51,13 @@ function harness(
 		options.root ?? mkdtempSync(join(tmpdir(), "radar-execution-test-"));
 	const calls: Array<{ method: string; params: any }> = [];
 	let minted = 0;
+	/** Attachment identities this daemon minted, in answer order. */
+	const claims: string[] = [];
+	const mintClaim = (): string => {
+		const claim = `00000000-0000-4000-8000-${String(900 + claims.length).padStart(12, "0")}`;
+		claims.push(claim);
+		return claim;
+	};
 	const client: RadarPublicationClient = {
 		ping: async () => ok({
 			protocol: 2,
@@ -59,12 +69,16 @@ function harness(
 		}),
 		presence: async (params) => {
 			calls.push({ method: "agent.presence", params });
+			options.order?.push("presence");
+			const claim = params.claim_id ?? mintClaim();
 			return ok({ registration_id: "00000000-0000-4000-8000-000000000001",
-				claim_id: params.claim_id, session_id: params.session_id, standing: "granted",
+				claim_id: claim, session_id: params.session_id, standing: "granted",
 				subject_id: params.session_id });
 		},
 		releasePresence: async (params) => {
 			calls.push({ method: "agent.release", params });
+			options.order?.push("release");
+			if (options.slowRelease) await options.slowRelease();
 			return ok({ ...params, standing: "released" });
 		},
 		acquire: async (params) => {
@@ -162,6 +176,7 @@ function harness(
 		events,
 		snapshots,
 		contexts,
+		claims,
 		async settled(): Promise<void> {
 			for (let tick = 0; tick < 8; tick += 1)
 				await new Promise((resolve) => setImmediate(resolve));
@@ -183,7 +198,8 @@ test("a subject is registered before anything is published about it", async () =
 		assert.equal(h.calls[0].params.incarnation, INCARNATION);
 		assert.equal(h.calls[0].params.process.pid, 123);
 		assert.equal(h.calls[0].params.session_id, "11111111-2222-4333-8444-555555555555");
-		assert.match(h.calls[0].params.claim_id, /^[0-9a-f-]{36}$/);
+		assert.equal(h.calls[0].params.claim_id, undefined);
+		assert.match(h.claims[0], /^[0-9a-f-]{36}$/);
 		assert.equal(h.calls.findIndex((call) => call.method === "agent.acquire"), 1);
 	} finally {
 		h.stop();
@@ -469,7 +485,7 @@ test("a replaced session is never renewed as the one it replaced", async () => {
 		await h.emit("session_shutdown");
 		assert.equal(
 			h.calls.find(call => call.method === "agent.release")?.params.claim_id,
-			h.contexts()[0].claim_id,
+			h.claims[0],
 		);
 		now += 60_000;
 		h.emit("session_start", {}, session(SECOND));
@@ -477,7 +493,44 @@ test("a replaced session is never renewed as the one it replaced", async () => {
 		const contexts = h.contexts();
 		assert.equal(contexts.length, 2);
 		assert.equal(contexts[1].session_id, SECOND);
-		assert.notEqual(contexts[1].claim_id, contexts[0].claim_id);
+		// Each session's first report names no claim, and Radar mints a new one.
+		assert.equal(contexts[0].claim_id, undefined);
+		assert.equal(contexts[1].claim_id, undefined);
+		assert.notEqual(h.claims[0], h.claims[1]);
+	} finally {
+		h.stop();
+	}
+});
+
+test("a session's shutdown completes its release before the next session starts", async () => {
+	// Pi awaits what a lifecycle handler returns, so the release must be part of
+	// the shutdown promise: the next session_start is ordered after it, and a
+	// discarded promise would let the new session present before the old released.
+	let release: (() => void) | undefined;
+	const released = new Promise<void>(resolve => { release = resolve; });
+	const order: string[] = [];
+	const h = harness({
+		slowRelease: () => released,
+		order,
+	});
+	try {
+		h.emit("session_start", {}, { isIdle: () => true });
+		await h.settled();
+		const shutting = h.emit("session_shutdown");
+		let returned = false;
+		void shutting.then(() => { returned = true; });
+		await new Promise(resolve => setTimeout(resolve, 20));
+		// The boundary is still open: the release has been asked for and not answered.
+		assert.equal(returned, false, "shutdown returned before its release completed");
+		assert.ok(order.includes("release"), order.join(","));
+		release?.();
+		await shutting;
+		h.emit("session_start", {}, { isIdle: () => false });
+		await h.settled();
+		assert.ok(
+			order.indexOf("release") < order.lastIndexOf("presence"),
+			`the new session presented before the old released: ${order.join(",")}`,
+		);
 	} finally {
 		h.stop();
 	}
@@ -534,7 +587,9 @@ test("a reloaded adapter reuses the process's one publisher", async () => {
 			// and the sequence continues where the process left it.
 			assert.deepEqual(second.calls, []);
 			assert.deepEqual(first.calls.filter(call => call.method === "agent.publish").map(call => call.params.sequence), [1, 2]);
-			assert.notEqual(first.contexts()[0].claim_id, first.contexts().at(-1).claim_id);
+			// The reload persists and reuses the attachment Radar minted for the
+			// session rather than asking for a second one.
+			assert.equal(first.claims.length, 1);
 			assert.deepEqual(first.snapshots(), [
 				{ activity: "idle" },
 				{ activity: "working" },

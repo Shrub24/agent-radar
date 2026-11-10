@@ -312,3 +312,23 @@ Radar mints the claim id a successor holds, including the reserved claim a resta
 **Reason:** this failed three times in one change, each time where an enumeration carried a predicate that had previously been cheap — `unclaimed` calling `settled`, the subject listing filtering on a claim's subject, and `bind_locked` reaching `fence_registration`. It is an incident rather than a theory: `std::sync::Mutex` reports nothing, the thread simply waits on itself, and the symptom is a suite that stops making progress rather than a failing assertion.
 
 **Consequence:** the pattern is "collect under the lock, decide after it", applied in `unclaimed` and the subject listing. A claim read inside a log guard is a defect even when it appears to work, because it only hangs on the path that reaches it.
+
+## The attachment identity is Radar's to mint, and the client only carries it
+
+**Id:** 7e39b2d6-4a18-4c05-8f57-2d91c6b03e84
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer ruling that session start sends registration and session and receives its claim, then a second ruling that session shutdown releases the claim, 2026-11-10
+**Verification:** corroborated — `a_claimless_report_recovers_the_attachment_it_already_made` fails with the discovery branch disabled, and `a_session's_shutdown_completes_its_release_before_the_next_session_starts` fails when the hook wrapper discards its handler's promise
+**Revisit when:** a client needs to present on a claim before the daemon has resolved the registration, or a session-start reason decides whether a reload deserves a new claim
+
+A presence report carries the process and the session; the claim id it names is optional and only ever one Radar answered with earlier. A claimless report resolves the registration's reservation, else its live claim for that same session, else mints one. A named claim resumes that attachment, is refused if it has been released, and is refused if it names a different session than the one the registration holds.
+
+**Reason:** while the client minted the id, the reserved claim a restart created could never be fulfilled — the daemon installed the client's id as a second pending claim and the reservation survived as an orphan. Client-minted identity also meant "the daemon returned an answer" and "the client persisted it" could disagree with no way to tell which was current.
+
+**Rejected alternative:** keep client-minted ids and drop reservations. Rejected: a restart must name its successor before either exists, which is what a reservation is for.
+
+**Rejected alternative:** accept whatever claim id a report names, including an unrecorded one. Rejected: an attachment identity that any caller can invent is not an identity, and the daemon cannot then tell a retry from a new attachment.
+
+**Consequence:** a lost first reply is recovered by reporting again, which is why the claimless path must be idempotent per (registration, session) — that idempotence is the recovery story, not a retry token. The lifecycle boundary is therefore load-bearing: Pi awaits a handler's return value, so the extension's hook wrapper must return its handler's promise or the next session starts before the previous release lands. A session-start reason is context only; nothing branches on it yet, so no field is carried.

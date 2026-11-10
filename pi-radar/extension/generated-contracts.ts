@@ -361,8 +361,16 @@ export interface SubjectListResultManagedMetadata {
   role?: string | null;
   run?: string | null;
 }
+/**
+ * One presence report. Identity is the process's own, never a caller's choice.
+ */
 export interface PresenceReportDeserialize {
-  claim_id: string;
+  /**
+   * The claim Radar returned for this attachment, echoed back on heartbeats and
+   * reconnects. A first report names none: Radar resolves its own reservation or
+   * mints the claim, so the client never owns an attachment identity.
+   */
+  claim_id?: string | null;
   incarnation: string;
   label?: string | null;
   location?: PresenceReportRegistryLocation | null;
@@ -417,7 +425,7 @@ export interface PresenceReportProcessIdentity {
 export type PresenceAnswerStanding = "reserved" | "pending" | "granted" | "duplicate" | "released";
 
 /**
- * The small public receipt; session/location context stays inside Radar.
+ * The small public receipt.
  */
 export interface PresenceAnswerSerialize {
   claim_id: string;

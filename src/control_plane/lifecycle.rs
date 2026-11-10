@@ -4796,7 +4796,7 @@ mod tests {
             crate::control_plane::registry::presence::begin(
                 &reopened,
                 &ticket.registration_id,
-                subject,
+                Some(subject),
                 &random_uuid(),
                 2,
             )
@@ -4806,7 +4806,7 @@ mod tests {
         let presented = crate::control_plane::registry::presence::begin(
             &reopened,
             &ticket.registration_id,
-            subject,
+            None,
             &session,
             2,
         )
