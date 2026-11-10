@@ -39,6 +39,66 @@ Not planned: an async rewrite of the domain actor (Tokio is already used for
 transport; the actor's sync loop is measurement-driven only), a generic RPC or
 operation framework, or one transport for every method.
 
+## Subsequent refactor: durable execution and response completion
+
+After the current [`unified-execution-lifecycle`](openspec/changes/unified-execution-lifecycle/proposal.md)
+claim and row rework, specify one execution policy for admitted commands and
+observation-triggered work. This is a separate scope, not an engine to introduce
+inside claim cleanup.
+
+### Current coverage and gap
+
+Source audit: explicit operations already persist input, mark Started before
+dispatch, persist settlement before replying and replay same-ID answers. Four
+lifecycle methods also log admission/start/settlement; other operations use request
+files. Presence and registry mutations write domain state and construct replies
+directly. The observation sweeper invokes effects procedurally and uses in-memory
+pagination cursors, not durable work acknowledgements. Domain replay rebuilds
+state; the public event journal's durable cursor acknowledges notification
+publication, not effect execution. Startup/operator reconciliation covers selected
+lifecycle and spawn effects and does not generally resume unfinished work.
+
+Evidence: `src/control_plane/server/admission.rs`, `store.rs`,
+`events/operations.rs`, `server/registration.rs`, `server/sweeper.rs`,
+`store/delivery.rs` and `reconcile.rs`. This was a source audit, not crash-injection
+validation or proof that every method follows the same guarantees.
+
+### Agreed direction
+
+- Raw observations and requests are stimuli. Meaningful transitions admit durable
+  work with stable identity, causation and sufficient private execution inputs.
+- Execution produces a durable terminal response: success or failure. That response
+  IS the completion record; do not maintain a separate effect-completion flag.
+- Missing terminal response means unsettled work. Recover by the operation's
+  idempotent reprocessing or reconciliation policy. An external effect without a
+  committed response follows that same policy, not a separate completion detector.
+- Nonterminal status, including uncertainty, must not masquerade as terminal
+  consumption. Reconcile the current Completed/Unknown semantics explicitly.
+- Inputs must survive the initiating connection, stack frame and process. Preserve
+  private request seeds or equivalent private storage; do not publish launch
+  credentials/recipes merely to make public events self-contained.
+- Follow-on work must remain durably discoverable. A cursor may track admission
+  or a contiguous consumed prefix; per-operation responses determine completion
+  when work finishes out of order. Do not advance past and lose unfinished work.
+- Reuse and consolidate existing admission, persistence, settlement and recovery.
+  No parallel workflow engine, transport rewrite or speculative general framework.
+  Keep fresh process/placement fences before external effects.
+
+### Decisions and acceptance still needed
+
+Choose the private work envelope, correlation and cursor semantics, recovery
+classification per operation, terminal response representation and transaction
+boundary. Distinguish replaying recorded facts from resuming admitted work: state
+replay itself must not blindly redispatch historical effects. Prove restart/lost-
+response handling, out-of-order consumption, interrupted follow-on work and
+idempotent/reconciled external effects at their real boundaries. Measure before
+changing concurrency or indexing for performance.
+
+The current managed rework still owns exact claim release, registration
+finalisation, maintained attachment indexes and ordered session hooks. It must
+reuse existing durable transition/recovery seams and leave the cross-daemon
+execution-policy consolidation to this follow-up.
+
 ## Managed lifecycle convergence — proposed
 
 Planning artifacts: [`unified-managed-lifecycle`](openspec/changes/unified-managed-lifecycle/proposal.md).

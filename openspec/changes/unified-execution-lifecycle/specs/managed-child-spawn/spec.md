@@ -3,12 +3,28 @@
 ## ADDED Requirements
 
 ### Requirement: A spawn edge is composed onto the execution it launches
-A spawn SHALL create its child through the same execution lifecycle as every other launch, and its edge SHALL be a record of the parent's intent keyed on the child's registration. The edge SHALL NOT require the child to have a subject or claim before its program runs; it SHALL bind to the child's subject when the child's session attaches.
+A spawn SHALL create its child through the shared execution lifecycle and record parent provenance keyed on the child's registration. The edge SHALL NOT require a subject or claim before the child runs. A fresh child SHALL attach its session's subject at grant; continuation of a known released child SHALL reserve that subject's successor claim before launch. Both SHALL use the same execution control and observation semantics.
 
 #### Scenario: A child launches without a subject
-- **WHEN** a spawn has created its child and the child has not yet reported a session
-- **THEN** the edge names the child's registration and no subject exists for the child
+- **WHEN** a fresh spawn has created its child and the child has not yet reported a session
+- **THEN** the edge names the child's registration and accepted parent intent without inventing a subject or claim
 
 #### Scenario: A child's session attaches
-- **WHEN** the child reports its first presence
-- **THEN** the edge binds to the subject that session holds, which is an existing subject when the session was already owned
+- **WHEN** a fresh child reports a verified session without a conflicting attachment reservation
+- **THEN** the edge binds to the subject resolved for that session, continuing its existing subject when applicable
+
+#### Scenario: A parent continues its released child
+- **WHEN** a parent is authorised to continue its own recorded detached child
+- **THEN** a new execution reserves a claim for that existing child subject and grants it only after verified presentation
+
+#### Scenario: Child metadata becomes subject metadata
+- **WHEN** a child's attachment is granted with accepted nonempty parent, owner, run or label metadata
+- **THEN** the subject receives the accepted launch metadata rather than losing it during enrollment
+
+#### Scenario: Continuation supplies no replacement metadata
+- **WHEN** a continuing session attaches without new managed metadata
+- **THEN** its subject retains its prior managed metadata
+
+#### Scenario: A child fails before attachment
+- **WHEN** a fresh child ends before acquiring a subject
+- **THEN** its execution and spawn outcome remain readable by registration and request without creating a detached subject

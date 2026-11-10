@@ -1,35 +1,81 @@
 # Tasks
 
+## Checkpoint and revised scope
+
+The initial implementation is committed at `5482f789` on
+`wip/unified-execution-lifecycle`, wire 18. Its gate and live acceptance passed.
+That evidence applies to the checkpoint, not to the revised grant/reservation and
+joined-row semantics in design.md. Reopened tasks below retain their identifiers;
+sections 6–9 cover the approved rework. No revised implementation is complete.
+
 ## 1. One execution constructor
 
-- [x] 1.1 Build the single execution constructor over the registration, with optional placement and optional launch intent; adoption's process creation is the base case. Delete `create_with_intent`'s minted subject and the reserved presence decision for launches with no subject.
-- [x] 1.2 Key `launch.claim`, capture, the pane-death wake, withdrawal and the sweeper cursor on the registration. Each has a test that fails if it reads the old claim key.
-- [x] 1.3 Configured `L` and container recipes reserve an execution only. First presence attaches a subject through enrollment; a launched program reports presence and gets a subject.
+- [ ] 1.1 Finish shared execution creation with optional placement and launch intent; compose identification and optional claim reservation around it. Reopened: adoption and launch still have separate construction entry points. Verify adoption, fresh launch and successor creation through their real callers; remove redundant constructors rather than asserting helper names.
+- [x] 1.2 Launch claiming, capture, pane-death wake, withdrawal and sweeper cursor address registrations at the initial checkpoint; library, control-plane and live lifecycle checks passed.
+- [x] 1.3 Configured `L` and container recipes reserve executions without placeholder subjects; presence enrolls them. Verified by the initial control-plane and live acceptance runs.
 
 ## 2. Restart
 
-- [x] 2.1 Restart uses the same constructor and attaches its successor claim to the existing subject through the shared attach step. Withdrawal revokes that claim and frees the subject. Existing restart tests pass unchanged.
+- [ ] 2.1 Reserve the successor against the known subject without replacing the incumbent grant; stop the exact predecessor and grant only after verified exit and release. Reopened: the checkpoint replaces `current_claim` at reservation. Verify authority preservation, failure cancellation and no launch before verified exit; see section 7.
 
 ## 3. Spawn
 
-- [x] 3.1 `spawn.create` creates its child through the constructor and writes the edge keyed on the child's registration. The edge binds to the child's subject at grant; a resumed session continues its existing subject.
-- [x] 3.2 Re-key the edge's exit observation, topology reads and `spawn.close` on the registration.
+- [ ] 3.1 Finish fresh and continuing child launch on the shared creator, preserving the registration-keyed edge and binding the subject at grant. Reopened for constructor and reservation rework. Verify parent-child queries and continuation of the same child subject with no placeholder subject.
+- [x] 3.2 Edge exit observation, topology reads and child close use the registration at the initial checkpoint; initial Rust and live lifecycle checks passed.
 
-## 3a. The request that addresses an execution
+## 3a. Execution-addressed control
 
-- [x] 3a.1 `lifecycle.cancel` and `lifecycle.stop` address the execution. `SubjectParams.claim_id` is optional and only fences the attachment the caller saw; `cancel_target` resolves the execution from either address and refuses a launch that never presented only when the caller names a claim it cannot have. `subjects::stop(registration)`, `subjects::cancel(registration)` and `revoke_execution` replace the claim-keyed wrappers, and `revoke(claim)` is gone with them.
-- [x] 3a.3 A settled withdrawal is withdrawn once: `settled` (revoked, no process, no live attachment) is the one rule the scan in `unclaimed` and `withdraw_locked` both ask, so a reservation with no spawn edge is not offered or processed twice.
-- [ ] 3a.2 `fence_registration` re-took the registry's transition lock, which `bind_locked` already holds, so every registration carrying a spawn token deadlocked the process. Fixed by keeping it a step whose caller serializes; a `*_locked` sibling split proved redundant and was dropped.
+- [x] 3a.1 Stop/cancel resolve an exact execution; subject-addressed requests require the selected claim while unattached launches need none. Initial control-plane suite passed. Recheck reservation-related fencing in section 7.
+- [x] 3a.2 Registration fencing uses its caller's transition lock instead of reacquiring it. The formerly hanging control-plane tests and full suite passed at the initial checkpoint.
+- [x] 3a.3 Settled withdrawal is not repeatedly offered or processed: revoked, no process, no live attachment and cleanup recorded. Initial control-plane suite passed; recheck optional reservation cleanup in section 7.
 
 ## 4. Observation and display
 
-- [ ] 4.1 The observation lists only attached subjects; the tree draws no subject row for a launch in flight. Decide from the tree's needs whether the pane row carries a published launch state. The launch row is gone, but a subject whose execution ended now renders as `unresolved` and a restarted agent's row as `unplaced`, so this decides what those rows say. The rule is applied: `lifecycle.get` and `lifecycle.list` read **subjects**, and a launch in flight is read from its execution record and `spawn.get`. The observation layer is execution-keyed (`observe_exit`, `observe_pane`, the sweep, the pane-death wake) and the client's `LifecycleControlRequest` names a subject *or* the spawn that made one. 167 of 176 control-plane tests pass; the nine left are listed under 4.
-- [x] 4.2 Move the spawn binding to the registration and settle the wire revision.
+- [ ] 4.1 Replace unmatched-subject fallback rows with registration-rooted joined rows and authoritative pre-presence execution observation. Reopened for the full projection, not merely hiding fresh-launch subjects. Verify the cases in section 8.
+- [x] 4.2 Initial spawn binding moved to registration and both peers use wire 18. New observation changes require another revision in section 8.
+- [x] 4.4 Initial control-plane fixtures read unattached launches through executions/spawn reads and subjects only after attachment; supervisor completion is reported against the execution. Checkpoint result: 176 passed, 1 ignored.
 
-- [x] 4.4 Every control-plane test reads a launch as what it is. A launch that has not presented is read from its execution record and `spawn.get`; a launch that has presented is read by the subject its grant created. The supervisor's code is reported through `launch.complete` and read back from the execution, which is the only place it lives. 176 pass.
+## 5. Initial checkpoint evidence
 
-## 5. Close out
+- [x] 5.1 Initial docs and changelog reflect execution-keyed launch behaviour. These do not document the revised model; update the affected documentation in sections 6–8.
+- [x] 5.2 Initial gate passed: fmt, strict Clippy, all Rust targets (576 library; 176 control-plane passed, 1 ignored), pi-radar contracts/133 tests/package check, OpenSpec strict and checked Nix package build. Do not count this as the revised gate.
+- [x] 5.3 Initial disposable lifecycle acceptance passed configured `L`, subject-preserving restart, `D`, branch close and shared escalation, admitted pane close, native move, nested workspace close, completion and Ctrl-C. Earlier unresolved/unplaced failure reports are superseded by this run; revised row semantics remain unverified.
 
-- [x] 5.1 Update the docs, changelog and upgrade note (earlier launch records are refused; `radar reset`).
-- [ ] 5.2 Gate: fmt, strict Clippy, `cargo test --locked`, pi-radar checks, OpenSpec strict, checked Nix build.
-- [ ] 5.3 Disposable live acceptance: `L`, restart, `spawn.create`, an unpresented launch withdrawn, and branch close. `L` and `spawn.create` pass; restart settles but leaves the predecessor subject `unresolved` and the successor `unplaced`, which is 4.1.
+## 5a. Verified hook contract and scoped execution policy
+
+Pi awaits shutdown before reload/session replacement and exposes startup/reload/new/resume/fork reasons. Radar's hook wrapper currently drops asynchronous handler promises, and session-start reporting is fire-and-forget. Correct those seams; do not invent an upstream hook race. Implementation and behavioural validation remain in 6.3.
+
+The broader durable work/event/terminal-response execution model is recorded in plan.md as a subsequent refactor. Do not add a separate engine, per-function journal or independent effect-completion flags in this change. Use existing durable transition and recovery seams; claim-derived indexes replace the superseded subject-pointer repair plan.
+
+## 6. Rework: execution and attachment ownership
+
+- [ ] 6.1 Complete task 1.1 and make claims reference their registration rather than embed process snapshots. Unify the presence decision and lifecycle claim into one authoritative attachment record. Retain reserved/pending/granted/denied/released semantics; add shared derived standing predicates and central granted-attachment resolution, not stored policy flags or a generic exclusivity boolean. Remove claim synchronisation and fallback execution ownership. Verify composed reads, completion after release and replay through existing behavioural seams; do not add source-layout assertions.
+- [ ] 6.2 Apply accepted launch metadata at grant with nonempty intent taking precedence and absent intent retaining continued subject metadata. Verify parentage and continuation through real enrollment; update managed-execution documentation with ownership and precedence.
+
+- [ ] 6.3 Preserve the hook promise chain and serialize session boundary work per registration. Shutdown releases the exact claim; start sends registration/session and persists Radar's returned ID; heartbeats/release name it. Resolve reserved IDs instead of replacing them. Carry start reason as context, not a retry token. Remove client-minted authoritative IDs, generic previous-claim replacement and its Reserved skip, with no adapter or mandatory attempt subsystem. Verify shutdown release actually completes before reload start, same-session new claim, lost first response recovery, reconnect, terminal-claim reports and stale release. Retain bounded existing transport-failure handling without silently abandoning queued releases or adding automatic intent retry.
+
+## 7. Rework: independent reservation and grant
+
+- [ ] 7.1 Remove independently writable subject current/reserved/last authority pointers. Maintain subject grant/reservation/history indexes derived from authoritative claim records, updating during serialised transitions and rebuilding at startup. Reject incompatible grants/reservations; no per-query rebuild or opportunistic process observation. Verify replay, interrupted index update, incumbent authority under reservation, competing grant/reservation refusal and cancellation preserving the incumbent. Update lifecycle documentation alongside the change.
+- [ ] 7.2 Complete task 2.1 and continuing-child reservation semantics in task 3.1. Verify no successor dispatch before verified exit and release, grant conflict refusal, stop failure settling only the successor reservation, and successor failure leaving a detached subject without restoring an exited grant. Do not add an early-successor retry workflow.
+- [ ] 7.3 Unify exact claim release and registration finalisation for session shutdown, verified execution end and launch withdrawal; remove pointer-only release and admission-time release_if_gone. Verify non-graceful exit settles claims without a new claimant, withdrawal settles reservations/resources once, interrupted finalisation resumes via existing durable evidence, and stale release cannot affect a successor. Demonstrate exclusion and stale-release guards fail focused negative controls; no general mutation harness or new execution engine.
+- [ ] 7.4 Handle own-reservation identity mismatch in the shared attachment operation: settle reservation, fail intended restart/continuation with a retained TUI error, then apply ordinary eligibility to the actual session. Do not retry automatically. Verify another registration's reservation is preserved and an actual-session grant cannot falsely complete the original intent.
+
+## 8. Rework: public observation and joined rows
+
+- [ ] 8.0 Measure the existing publication path and representative execution-backed collection cost before adopting performance optimisations. Record workload/results. The maintained claim-derived attachment index is required for model ownership; additional publication indexes require evidence.
+- [ ] 8.1 Publish public execution summaries with placement and distinct optional reserved/granted attachment references before presence, including recipe/container launches without spawn edges. Advance changed record versions and wire to 19, retaining unreleased Radar 0.12.0 and pi-radar 0.16.0; regenerate contracts for exact matching peers, with broad alpha reset and no compatibility or migration paths. Verify representative producer/consumer round trips and absence of private launch data; update public contract documentation.
+- [ ] 8.2 Complete task 4.1: one included registration row joined to its optional claim/subject and topology; no duplicate plain pane or default detached-subject rows. Use a derived row record composing registration and optional claim/subject, not a durable row store or another placement owner. Hide revoked never-presented launches; accept one-time row-key selection/fold reset. Verify launch-to-presence row identity, a reserved successor sharing a subject, unplaced executions and unregistered panes under existing history filters; update dashboard documentation.
+- [ ] 8.3 Preserve exact registration and attachment identity in selected/frozen actions as row enrichment and grants change. Verify confirmation cannot retarget a successor and verified pane moves change containment without changing execution identity.
+
+## 9. Rework integration acceptance
+
+- [ ] 9.1 Run disposable live acceptance on revised `L`, fresh child, continued child, restart and branch close, including a launch without a spawn edge. Observe one row through launch and grant, no separate reservation/subject row, and no successor dispatch before verified predecessor exit. Record any operator-only acceptance still outstanding rather than claiming it passed.
+- [ ] 9.2 Run fmt, strict Clippy, all Rust targets, pi-radar contracts/typecheck/tests/package checks, strict OpenSpec validation and the checked Nix package build on the revised tree. Review the diff for copied state, parallel lifecycle paths and leftover compatibility before claiming completion.
+
+## Workflow follow-up
+
+- The general execution-policy refactor in plan.md is subsequent work, not an unchecked prerequisite silently expanding this change.
+- Review the revised implementation and operator acceptance evidence before archive.
+- Sync and archive this existing change only after the revised tasks pass.
+- Merge, tags, release and live deployment require separate explicit approval.
