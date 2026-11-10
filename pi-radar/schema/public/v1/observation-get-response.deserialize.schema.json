@@ -1150,6 +1150,10 @@
         "process": {
           "$ref": "#/$defs/ProcessIdentity"
         },
+        "registration_id": {
+          "description": "The execution this attachment is. A row and the action it offers are keyed\nby it, so a grant changing later cannot retarget a confirmed action.",
+          "type": "string"
+        },
         "session": {
           "type": [
             "string",
@@ -1166,6 +1170,7 @@
       "required": [
         "subject_id",
         "claim_id",
+        "registration_id",
         "process",
         "metadata",
         "state"

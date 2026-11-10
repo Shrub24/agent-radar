@@ -11,6 +11,11 @@ pub(super) struct SubjectParams {
     pub(super) claim_id: Option<ClaimId>,
     #[serde(default)]
     pub(super) spawn_request_id: Option<String>,
+    /// The exact execution the caller saw, when its row was keyed by one. A row is
+    /// a registration, so this is what keeps a confirmation from acting on a
+    /// different process after the subject's attachment changed.
+    #[serde(default)]
+    pub(super) registration_id: Option<RegistrationId>,
 }
 
 /// Validates, records and dispatches a cancel or stop of a tracked launch.
@@ -861,6 +866,17 @@ pub(super) fn cancel_target(
             ));
         }
     };
+    // A confirmation names the execution it was shown. If that execution is no
+    // longer the one this address resolves to, the row the operator agreed to act
+    // on is not the row that would be acted on, so nothing is dispatched.
+    if let Some(seen) = &params.registration_id
+        && seen != &execution
+    {
+        return Err(Refusal::new(
+            Code::Refused,
+            "the execution the caller saw is no longer the one recorded; nothing was signalled",
+        ));
+    }
     // An attached subject is only acted on for the claim the caller saw, so a
     // stale release cannot revoke a newer grant. An execution with no attachment
     // has no claim to name, which is the ordinary state of a launch in flight.

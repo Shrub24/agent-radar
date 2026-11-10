@@ -122,6 +122,9 @@ impl LifecycleSubject {
 pub struct ManagedSubject {
     pub subject_id: SubjectId,
     pub claim_id: ClaimId,
+    /// The execution this attachment is. A row and the action it offers are keyed
+    /// by it, so a grant changing later cannot retarget a confirmed action.
+    pub registration_id: crate::identity::RegistrationId,
     pub process: ProcessIdentity,
     pub metadata: crate::control_plane::lifecycle::ManagedMetadata,
     pub child_close: Option<ChildCloseTarget>,
@@ -430,8 +433,12 @@ fn managed_subject(
         .registration_id
         .clone()
         .or(subject.bound_registration_id.clone());
+    // The execution is the registration this subject is bound to, which the join
+    // above already established.
+    let execution = agent.registration.registration_id.clone();
     Some(ManagedSubject {
         subject_id: subject.subject_id.clone(),
+        registration_id: execution,
         process: claim.clone(),
         metadata: subject.managed.clone(),
         child_close: spawn

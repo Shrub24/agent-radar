@@ -2514,6 +2514,7 @@ mod tests {
                     }),
                     managed: Some(crate::registry_observation::ManagedSubject {
                         subject_id: crate::identity::SubjectId::random(),
+                        registration_id: crate::identity::RegistrationId::random(),
                     claim_id: crate::identity::ClaimId::random(),
                         process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
                         metadata: crate::control_plane::lifecycle::ManagedMetadata::default(),

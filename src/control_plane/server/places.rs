@@ -1338,6 +1338,7 @@ mod tests {
             execution: execution.then(|| crate::control_plane::command::Subject {
                 subject_id: SubjectId::random(),
                 claim_id: ClaimId::random(),
+                registration_id: None,
             }),
             identity: TargetIdentity::Pane(PaneIdentity {
                 pane_id: "p".into(),

@@ -388,6 +388,7 @@ pub(super) fn execute_command(
                 subject_id: Some(subject.subject_id),
                 claim_id: Some(subject.claim_id),
                 spawn_request_id: None,
+                registration_id: None,
             },
             requester,
             core,

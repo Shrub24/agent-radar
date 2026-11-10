@@ -394,6 +394,7 @@ fn subject_plan(
     let subject = Subject {
         subject_id: subject.subject_id,
         claim_id: subject.claim_id,
+        registration_id: Some(subject.registration_id.clone()),
     };
     let action = match operation {
         crate::app::Operation::Restart => DomainAction::Restart(subject),

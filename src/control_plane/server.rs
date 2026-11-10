@@ -1317,15 +1317,30 @@ mod tests {
             subject_id: Some(subject_id.clone()),
             claim_id: Some(ClaimId::random()),
             spawn_request_id: None,
+            registration_id: None,
         };
         let Err(refusal) = cancel_target(&registry, &stale) else {
             panic!("a stale claim is refused");
         };
         assert!(refusal.message.contains("not current"), "{refusal:?}");
+        // A confirmation names the execution it was shown: the same address with a
+        // different registration is refused, because the row the operator agreed
+        // to act on is not the row that would be acted on.
+        let other_execution = SubjectParams {
+            subject_id: Some(subject_id.clone()),
+            claim_id: Some(reserved.clone()),
+            spawn_request_id: None,
+            registration_id: Some(crate::identity::RegistrationId::random()),
+        };
+        let Err(refusal) = cancel_target(&registry, &other_execution) else {
+            panic!("an execution the caller did not see is refused");
+        };
+        assert!(refusal.message.contains("no longer the one"), "{refusal:?}");
         let current = SubjectParams {
             subject_id: Some(subject_id),
             claim_id: Some(reserved.clone()),
             spawn_request_id: None,
+            registration_id: Some(claim.registration_id.clone()),
         };
         let (execution, claim, _) =
             cancel_target(&registry, &current).expect("the current claim is admitted");

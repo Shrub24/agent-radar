@@ -1607,6 +1607,11 @@ export interface ManagedSubject {
   ended: boolean;
   metadata: ManagedMetadata;
   process: ProcessIdentity3;
+  /**
+   * The execution this attachment is. A row and the action it offers are keyed
+   * by it, so a grant changing later cannot retarget a confirmed action.
+   */
+  registration_id: string;
   session: string | null;
   state: State;
   subject_id: string;
