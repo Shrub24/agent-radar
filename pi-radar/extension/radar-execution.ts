@@ -367,6 +367,7 @@ export function createRadarExecutionAdapter(
 		// so the run state comes from Pi's context rather than an assumed idle.
 		active = context?.isIdle?.() === false;
 		emit();
+		return publication.presence.ensure();
 	});
 
 	on("agent_start", () => {

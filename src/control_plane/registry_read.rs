@@ -251,46 +251,11 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
 fn executions(registry: &Registry) -> Result<Vec<crate::model::ExecutionObservation>, String> {
     use crate::control_plane::events::Standing;
     let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    // One pass over the claims resolves, per subject, the grant that holds it, the
-    // reservation waiting for it, and the session it carries.
-    #[derive(Default)]
-    struct Attachment {
-        grant: Option<crate::identity::ClaimId>,
-        reservation: Option<crate::identity::ClaimId>,
-        session: Option<String>,
-    }
-    let mut subjects: std::collections::BTreeMap<crate::identity::SubjectId, Attachment> =
-        std::collections::BTreeMap::new();
-    let mut owners: std::collections::BTreeMap<
-        crate::identity::RegistrationId,
-        crate::identity::SubjectId,
-    > = std::collections::BTreeMap::new();
-    for claim in log.ids() {
-        let Some(facts) = log.facts(claim) else {
-            continue;
-        };
-        let Some(subject) = facts.subject_id.clone() else {
-            continue;
-        };
-        owners.insert(facts.registration_id.clone(), subject.clone());
-        let entry = subjects.entry(subject).or_default();
-        match facts.standing {
-            Standing::Reserved if entry.reservation.is_none() => {
-                entry.reservation = Some(claim.clone())
-            }
-            _ if facts.standing.grants_authority() && entry.grant.is_none() => {
-                entry.grant = Some(claim.clone());
-                entry.session = facts.session.clone();
-            }
-            _ => {}
-        }
-    }
     let mut published = Vec::new();
     for (registration_id, execution) in log.processes() {
-        let subject_id = owners.get(registration_id).cloned();
-        let attachment = subject_id
-            .as_ref()
-            .and_then(|subject| subjects.get(subject));
+        let attachment = log
+            .claim_of_registration(registration_id)
+            .and_then(|claim| log.facts(&claim).map(|facts| (claim, facts)));
         published.push(crate::model::ExecutionObservation {
             registration_id: registration_id.clone(),
             state: execution.state,
@@ -306,12 +271,20 @@ fn executions(registry: &Registry) -> Result<Vec<crate::model::ExecutionObservat
                 }
             },
             placement: execution.placement.clone(),
-            subject_id,
-            claim_id: attachment.and_then(|attachment| attachment.grant.clone()),
-            reserved_claim_id: attachment.and_then(|attachment| attachment.reservation.clone()),
+            subject_id: attachment
+                .as_ref()
+                .and_then(|(_, facts)| facts.subject_id.clone()),
+            claim_id: attachment
+                .as_ref()
+                .filter(|(_, facts)| facts.standing.grants_authority())
+                .map(|(claim, _)| claim.clone()),
+            reserved_claim_id: attachment
+                .as_ref()
+                .filter(|(_, facts)| facts.standing == Standing::Reserved)
+                .map(|(claim, _)| claim.clone()),
             process: execution.process.clone(),
             bound_registration_id: execution.bound_registration_id.clone(),
-            session: attachment.and_then(|attachment| attachment.session.clone()),
+            session: attachment.and_then(|(_, facts)| facts.session),
             ended: execution.exited_at.is_some()
                 || execution.ended_externally_at.is_some()
                 || execution.completion.is_some(),

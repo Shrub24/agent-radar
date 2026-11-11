@@ -39,6 +39,7 @@ function harness(
 		scheduler?: RadarScheduler;
 		/** Holds a release open, so a test can see whether the boundary awaited it. */
 		slowRelease?: () => Promise<void>;
+		slowPresence?: () => Promise<void>;
 		order?: string[];
 	} = {},
 ) {
@@ -70,6 +71,7 @@ function harness(
 		presence: async (params) => {
 			calls.push({ method: "agent.presence", params });
 			options.order?.push("presence");
+			await options.slowPresence?.();
 			const claim = params.claim_id ?? mintClaim();
 			return ok({ registration_id: "00000000-0000-4000-8000-000000000001",
 				claim_id: claim, session_id: params.session_id, standing: "granted",
@@ -498,6 +500,27 @@ test("a replaced session is never renewed as the one it replaced", async () => {
 		assert.equal(contexts[1].claim_id, undefined);
 		assert.notEqual(h.claims[0], h.claims[1]);
 	} finally {
+		h.stop();
+	}
+});
+
+test("a session's start awaits its initial presence response", async () => {
+	let answer!: () => void;
+	const pending = new Promise<void>(resolve => { answer = resolve; });
+	const h = harness({ slowPresence: () => pending });
+	let returned = false;
+	const starting = h.emit("session_start", { reason: "startup" }, { isIdle: () => true });
+	void starting.then(() => { returned = true; });
+	try {
+		await h.settled();
+		assert.ok(h.calls.some(call => call.method === "agent.presence"));
+		assert.equal(returned, false, "start returned while its presence response was still pending");
+		answer();
+		await starting;
+		assert.equal(h.claims.length, 1);
+	} finally {
+		answer();
+		await starting;
 		h.stop();
 	}
 });

@@ -4,6 +4,11 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 ## Radar 0.12.0
 
+- Refuse a second successor reservation while preserving the incumbent grant and first reservation; another registration cannot cancel that reservation by enrolling the same session.
+- Execution observations publish their own attachment references, not another execution's grant or reservation on the same subject.
+- Invalidate subject inspection when its sampled grant changes, and resume interrupted claim release when an observer finds an already-recorded execution exit.
+- pi-radar returns the initial presence response attempt through the awaited `session_start` hook, as it already does for shutdown release. Transport-failure recovery across session boundaries remains incomplete.
+
 - **Breaking (lifecycle):** a launch reserves an execution and nothing else. An execution is identified by its registration from the moment it is reserved; the process identity is recorded when it is verified, and a claim with its subject attaches only when a session reports presence. `L`, container recipes and `spawn.create` no longer mint a subject or a claim, and the claimed "reserved subject" row for a launch in flight is gone.
 - Restart is unchanged from the operator's side: the subject already exists, so restart reserves its successor claim up front and attaches it to that subject.
 - **Breaking (library):** a claim is the one record of an attachment. Its standing (reserved, pending, granted, duplicate, released) is a recorded lifecycle transition, so a subject's current grant, its reservation and its previous grant are derived from claims in recorded order. `SubjectRecord` no longer carries `current_claim` or `last_claim`, `presence::Decision` no longer carries a location, the `claims/` decision files and their `current-<registration>` projection are gone, and `release_attachment` is deleted in favour of `release_claim`.

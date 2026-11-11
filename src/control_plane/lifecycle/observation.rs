@@ -115,6 +115,7 @@ pub fn observe_exit_from(
         return Ok(false);
     };
     if execution.exited_at.is_some() {
+        super::record_exit(registry, &execution, now_ms)?;
         return Ok(true);
     }
     let Some(process) = execution.identity else {
@@ -147,6 +148,7 @@ pub fn observe_exit_from(
         return Err("process binding changed during reconciliation".into());
     }
     if current.exited_at.is_some() {
+        record_exit_locked(registry, &mut current, now_ms)?;
         return Ok(true);
     }
     if current

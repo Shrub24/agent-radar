@@ -460,14 +460,8 @@ pub(super) fn cleanup_launch_pane(
         let core = locked(core);
         (Arc::clone(&core.registry), Arc::clone(&core.verifier))
     };
-    let claim = match subjects::read_process(&registry, key) {
-        Ok(Some(execution)) => subjects::Claim {
-            claim_id: crate::identity::ClaimId::random(),
-            subject_id: crate::identity::SubjectId::random(),
-            managed: execution.managed.clone(),
-            session: None,
-            process: execution,
-        },
+    let execution = match subjects::read_process(&registry, key) {
+        Ok(Some(execution)) => execution,
         Ok(None) => return None,
         // A record that cannot be read is not an absence: nothing is dispatched
         // on evidence this daemon could not check, and the reason says so.
@@ -476,14 +470,13 @@ pub(super) fn cleanup_launch_pane(
             return Some(PaneCleanup::Refused(refusal));
         }
     };
-    if let Some(cleanup) = claim.process.pane_cleanup {
+    if let Some(cleanup) = execution.pane_cleanup {
         return Some(cleanup);
     }
-    if matches!(intent, CleanupIntent::Retire) && claim.process.origin != subjects::Origin::Spawned
-    {
+    if matches!(intent, CleanupIntent::Retire) && execution.origin != subjects::Origin::Spawned {
         return None;
     }
-    let placement = claim.process.placement?;
+    let placement = execution.placement?;
     let pane = placement.location.pane?;
     let instance = placement.instance?;
     if serving_identity(backend, &verifier, stopping, budget).as_ref() != Some(&instance) {
@@ -491,7 +484,7 @@ pub(super) fn cleanup_launch_pane(
             "the execution's serving generation is no longer current".into(),
         ));
     }
-    subjects::await_completion(&registry, &claim.process.registration_id);
+    subjects::await_completion(&registry, &execution.registration_id);
     let inventory = match bounded_inventory(
         backend,
         stopping,

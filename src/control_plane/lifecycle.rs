@@ -950,6 +950,11 @@ pub fn create_with_intent(
         if read_subject_record(registry, subject_id)?.is_none() {
             return Err("subject is not recorded".into());
         }
+        if reserved_claim(registry, subject_id)?.is_some() {
+            return Err(
+                "the subject already has a reserved successor; no launch was reserved".into(),
+            );
+        }
         // A released subject has no granted claim, so its last grant is what a
         // continuation succeeds.
         if current_attachment(registry, subject_id)?.map(|claim| claim.claim_id)
@@ -2099,17 +2104,6 @@ pub fn enroll_subject(
     // parent it was spawned for, its owner and run — says what this attachment is
     // for now, so the execution's metadata wins when it carries any.
     let continuing = subject_record_for_session(registry, session)?;
-    // A reservation for this session's own subject that names another execution is
-    // a restart or continuation that will not arrive: the session came back on a
-    // different process. Settle it before judging the attachment, so it neither
-    // holds the subject until its deadline nor blocks the session that returned.
-    if let Some(record) = &continuing
-        && let Some(reserved) = reserved_claim(registry, &record.subject_id)?
-        && read_claim(registry, &reserved)?
-            .is_some_and(|claim| &claim.process.registration_id != registration_id)
-    {
-        release_claim(registry, &reserved)?;
-    }
     match attachment(registry, registration_id, session, now_ms)? {
         Attachment::Other(_) => {
             return Err("the session is already attached to another live process".into());
@@ -4023,20 +4017,7 @@ mod tests {
         let registry = scratch.registry();
         // A claim exists before a process only as a successor to a subject that
         // already exists, so that is the reservation this test cancels.
-        let incumbent = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let ticket = create_with_intent(
-            &registry,
-            SPAWN,
-            launch(),
-            None,
-            Some((
-                incumbent.subject_id.clone().expect("a subject"),
-                incumbent.claim_id.clone().expect("a claim"),
-            )),
-            ManagedMetadata::default(),
-            1,
-        )
-        .expect("a successor reservation");
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("a successor reservation");
         let subject = &ticket.claim_id.clone().expect("a claim");
 
         let cancelled =
@@ -4100,6 +4081,8 @@ mod tests {
             parent_subject_id: SubjectId::parse("01a10c77-8a6b-7035-8a0e-b1fa607bb507"),
         };
         let incumbent = create(&registry, SPAWN, launch(), None, 1).expect("a subject");
+        release_claim(&registry, incumbent.claim_id.as_ref().expect("claim"))
+            .expect("release the first reservation");
         let first = create_with_intent(
             &registry,
             SPAWN,
@@ -4125,6 +4108,8 @@ mod tests {
             "extension"
         );
 
+        release_claim(&registry, first.claim_id.as_ref().expect("claim"))
+            .expect("release before reserving another successor");
         let successor = create_with_intent(
             &registry,
             &random_uuid(),
@@ -4159,7 +4144,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reservation_that_can_never_arrive_is_settled_when_the_session_returns() {
+    fn another_registration_cannot_clear_a_subject_s_reservation() {
         let scratch = Scratch::new("reservation-mismatch");
         let registry = scratch.registry();
         let session = random_uuid();
@@ -4194,8 +4179,7 @@ mod tests {
             .subject_id;
         release_claim(&registry, &claim).expect("the attachment ends");
 
-        // A restart reserves a successor for the subject, and that successor never
-        // arrives: the operator resumed the session on another process instead.
+        // Another process cannot take over an exclusive successor reservation.
         let successor = create_with_intent(
             &registry,
             &random_uuid(),
@@ -4223,7 +4207,7 @@ mod tests {
         )
         .expect("a second execution")
         .registration_id;
-        let attached = enroll_subject(
+        let refusal = enroll_subject(
             &registry,
             &ClaimId::random(),
             &elsewhere,
@@ -4236,20 +4220,13 @@ mod tests {
             launch(),
             5,
         )
-        .expect("the session returns on a different process");
+        .expect_err("another registration is excluded");
 
-        assert_eq!(
-            read_claim(&registry, &attached)
-                .expect("read")
-                .expect("claim")
-                .subject_id,
-            subject,
-            "the presented session continues its own subject"
-        );
+        assert!(refusal.contains("already attached"), "{refusal}");
         assert_eq!(
             reserved_claim(&registry, &subject).expect("reservation"),
-            None,
-            "a reservation that can never arrive no longer holds the subject"
+            successor.claim_id.clone(),
+            "the exclusive reservation is unchanged"
         );
         assert_eq!(
             crate::control_plane::registry::presence::decision(
@@ -4259,8 +4236,142 @@ mod tests {
             .expect("decision")
             .expect("claim")
             .standing,
-            crate::control_plane::registry::presence::Standing::Released,
-            "the intended restart is settled rather than left pending"
+            crate::control_plane::registry::presence::Standing::Reserved,
+            "another registration cannot settle the intended restart"
+        );
+    }
+
+    #[test]
+    fn publication_keeps_each_execution_s_own_attachment() {
+        use crate::control_plane::events::{Source, Transition};
+        let scratch = Scratch::new("publication-attachments");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("incumbent");
+        let incumbent = first.claim_id.expect("claim");
+        let subject = first.subject_id.expect("subject");
+        append_claim(
+            &registry,
+            &incumbent,
+            "2026-01-01T00:00:01.000Z",
+            Source::Registration,
+            Transition::Granted {
+                subject_id: subject.clone(),
+            },
+        )
+        .expect("grant");
+        let successor = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((subject.clone(), incumbent.clone())),
+            ManagedMetadata::default(),
+            2,
+        )
+        .expect("reservation");
+        let reserved = successor.claim_id.expect("claim");
+        let read =
+            crate::control_plane::registry_read::read(&registry, None, 3).expect("publication");
+        let old = read
+            .executions
+            .iter()
+            .find(|row| row.registration_id == first.registration_id)
+            .expect("incumbent row");
+        let next = read
+            .executions
+            .iter()
+            .find(|row| row.registration_id == successor.registration_id)
+            .expect("successor row");
+        assert_eq!(old.claim_id, Some(incumbent.clone()));
+        assert_eq!(
+            old.reserved_claim_id, None,
+            "the predecessor does not own its successor's reservation"
+        );
+        assert_eq!(
+            next.claim_id, None,
+            "a reservation is not its predecessor's grant"
+        );
+        assert_eq!(next.reserved_claim_id, Some(reserved.clone()));
+        release_claim(&registry, &incumbent).expect("release incumbent");
+        append_claim(
+            &registry,
+            &reserved,
+            "2026-01-01T00:00:04.000Z",
+            Source::Registration,
+            Transition::Granted {
+                subject_id: subject,
+            },
+        )
+        .expect("grant successor");
+        let read =
+            crate::control_plane::registry_read::read(&registry, None, 5).expect("publication");
+        let old = read
+            .executions
+            .iter()
+            .find(|row| row.registration_id == first.registration_id)
+            .expect("incumbent row");
+        let next = read
+            .executions
+            .iter()
+            .find(|row| row.registration_id == successor.registration_id)
+            .expect("successor row");
+        assert_eq!(
+            old.claim_id, None,
+            "the predecessor cannot publish its successor's grant"
+        );
+        assert_eq!(next.claim_id, Some(reserved));
+    }
+
+    #[test]
+    fn subject_inspection_is_invalidated_when_its_grant_changes() {
+        use crate::control_plane::events::{Source, Transition};
+        let scratch = Scratch::new("subject-inspection-grant");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("incumbent");
+        let incumbent = first.claim_id.expect("claim");
+        let subject = first.subject_id.expect("subject");
+        append_claim(
+            &registry,
+            &incumbent,
+            "2026-01-01T00:00:01.000Z",
+            Source::Registration,
+            Transition::Granted {
+                subject_id: subject.clone(),
+            },
+        )
+        .expect("grant");
+        let record = read_subject_record(&registry, &subject)
+            .expect("read")
+            .expect("subject");
+        let inspected = crate::control_plane::subject_read::read(&registry, record, 2, |_| {
+            release_claim(&registry, &incumbent).expect("release during verification");
+            let successor = create_with_intent(
+                &registry,
+                &random_uuid(),
+                launch(),
+                None,
+                Some((subject.clone(), incumbent)),
+                ManagedMetadata::default(),
+                3,
+            )
+            .expect("successor");
+            append_claim(
+                &registry,
+                &successor.claim_id.expect("claim"),
+                "2026-01-01T00:00:04.000Z",
+                Source::Registration,
+                Transition::Granted {
+                    subject_id: subject,
+                },
+            )
+            .expect("grant during verification");
+            crate::control_plane::registry::ProcessVerification::Verified
+        })
+        .expect("inspection");
+        assert_eq!(
+            inspected.state,
+            crate::control_plane::public_contracts::subject::AttachmentState::Unknown,
+            "verification of the old grant cannot describe the successor"
         );
     }
 
@@ -4416,6 +4527,7 @@ mod tests {
         let first = create(&registry, SPAWN, launch(), None, 1).expect("first execution");
         let logical_id = first.subject_id.clone().expect("a subject");
         let incumbent = first.claim_id.clone().expect("a claim");
+        release_claim(&registry, &incumbent).expect("release the first reservation");
         let second = create_with_intent(
             &registry,
             &random_uuid(),
@@ -4639,7 +4751,25 @@ mod tests {
         child.0.kill().expect("kill");
         child.0.wait().expect("wait");
 
-        record_exit(&registry, &execution, 3).expect("verified exit");
+        record_process_transition(
+            &registry,
+            &registration,
+            crate::control_plane::events::Source::ProcessObservation,
+            crate::control_plane::events::Transition::ExitVerified,
+            3,
+        )
+        .expect("exit persisted before claim release");
+        assert!(
+            observe_exit(&registry, &registration, &Uninspected, 4).expect("resume finalisation")
+        );
+        assert_eq!(
+            crate::control_plane::registry::presence::decision(&registry, &claim_id)
+                .expect("decision")
+                .expect("claim")
+                .standing,
+            crate::control_plane::registry::presence::Standing::Released,
+            "observing an established exit resumes interrupted claim release"
+        );
         let ended = read_process(&registry, &registration)
             .expect("read")
             .expect("execution")
@@ -4969,7 +5099,8 @@ mod tests {
             "a reservation grants no authority"
         );
 
-        // A successor holds the subject without taking the incumbent's authority.
+        release_claim(&registry, first.claim_id.as_ref().expect("claim"))
+            .expect("release the first reservation");
         let second = create_with_intent(
             &registry,
             &random_uuid(),
@@ -5074,6 +5205,8 @@ mod tests {
         let registry = scratch.registry();
         let first = create(&registry, SPAWN, launch(), None, 1).expect("first claim");
         let subject_id = first.subject_id.clone().expect("a subject");
+        release_claim(&registry, first.claim_id.as_ref().expect("claim"))
+            .expect("release the first reservation");
         let reserved = create_with_intent(
             &registry,
             &random_uuid(),
@@ -5141,6 +5274,25 @@ mod tests {
         .expect("successor reserves the predecessor")
         .claim_id
         .expect("a reserved claim");
+
+        let executions = registry.events.lock().unwrap().processes().count();
+        assert!(
+            create_with_intent(
+                &registry,
+                &random_uuid(),
+                launch(),
+                None,
+                Some((subject_id.clone(), incumbent.clone())),
+                ManagedMetadata::default(),
+                3,
+            )
+            .is_err(),
+            "a live incumbent cannot reserve two successors"
+        );
+        assert_eq!(
+            registry.events.lock().unwrap().processes().count(),
+            executions
+        );
 
         assert_eq!(
             current_attachment(&registry, &subject_id)

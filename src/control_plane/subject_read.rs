@@ -11,6 +11,7 @@ pub(crate) fn read(
     now_ms: i64,
     verify: impl FnOnce(Option<ProcessIdentity>) -> ProcessVerification,
 ) -> Result<Subject, String> {
+    let granted = lifecycle::granted_claim(registry, &record.subject_id)?;
     let claim = lifecycle::current_attachment(registry, &record.subject_id)?;
     let mut result = Subject {
         subject_id: record.subject_id.clone(),
@@ -34,8 +35,7 @@ pub(crate) fn read(
     let Some(claim) = claim else {
         return Ok(result);
     };
-    let current =
-        lifecycle::granted_claim(registry, &record.subject_id)?.as_ref() == Some(&claim.claim_id);
+    let current = granted.as_ref() == Some(&claim.claim_id);
     let process = &claim.process;
     result.scoped = Some(process.scope.is_some());
     let standing = presence::decision(registry, &claim.claim_id)?;
@@ -81,9 +81,7 @@ pub(crate) fn read(
     }
     // Verification is external; a concurrent attachment change invalidates this
     // sample rather than letting it describe the replacement with old evidence.
-    if lifecycle::granted_claim(registry, &record.subject_id)?
-        != lifecycle::granted_claim(registry, &record.subject_id)?
-    {
+    if lifecycle::granted_claim(registry, &record.subject_id)? != granted {
         result.state = AttachmentState::Unknown;
         result.location = None;
         result.execution = None;
