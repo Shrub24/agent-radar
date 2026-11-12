@@ -498,6 +498,9 @@ impl FleetTree {
         // retained). `claimed` is global so a pane yields exactly one row in
         // the whole tree, whatever workspace its facts place it in.
         let mut claimed: HashSet<&str> = HashSet::new();
+        // Registrations an agent row already shows: their execution is that row,
+        // enriched, not a second one.
+        let mut represented: HashSet<&crate::identity::RegistrationId> = HashSet::new();
         let mut roots: Vec<TreeNode> = Vec::new();
         let mut workspace_index: HashMap<&str, usize> = HashMap::new();
         // The tab row of each window drawn as a tab, by workspace and tab id.
@@ -525,6 +528,7 @@ impl FleetTree {
                 if joined && !claimed.insert(pane_id) {
                     continue; // duplicate agent record for an already-rowed pane
                 }
+                represented.insert(&agent.registry.agent.registration.registration_id);
                 let (pane, foreground) = if joined {
                     (inventory.pane(pane_id), state.foreground(pane_id).cloned())
                 } else {
@@ -548,6 +552,7 @@ impl FleetTree {
                 if !claimed.insert(pane_id.as_str()) {
                     continue; // a current row already represents this pane
                 }
+                represented.insert(&agent.registry.agent.registration.registration_id);
                 let pane = inventory.pane(pane_id);
                 agents.push((
                     Nestable {
@@ -594,7 +599,12 @@ impl FleetTree {
         // an execution Radar tracks is that execution's row: one row per pane, and
         // no separate plain-pane row beside it.
         let mut by_pane: HashMap<&str, &crate::model::ExecutionObservation> = HashMap::new();
+        // An ended execution does not occupy its pane: the shell it left behind is
+        // an ordinary pane again, and the ended execution is history.
         for execution in &inventory.executions {
+            if execution.ended || represented.contains(&execution.registration_id) {
+                continue;
+            }
             if let Some(pane) = execution
                 .placement
                 .as_ref()
@@ -603,7 +613,6 @@ impl FleetTree {
                 by_pane.entry(pane).or_insert(execution);
             }
         }
-        let mut represented: HashSet<&crate::identity::RegistrationId> = HashSet::new();
         let mut pane_seen: HashSet<&str> = HashSet::new();
         for pane in &inventory.panes {
             let pane_id = pane.location.pane_id.as_str();
@@ -617,7 +626,15 @@ impl FleetTree {
                 && !hidden(execution)
             {
                 represented.insert(&execution.registration_id);
-                roots[root_index].children.push(TreeNode {
+                let window = (
+                    pane.location.workspace_id.clone(),
+                    pane.location.tab_id.clone(),
+                );
+                let siblings = match tab_rows.get(&window) {
+                    Some(&position) => &mut roots[root_index].children[position].children,
+                    None => &mut roots[root_index].children,
+                };
+                siblings.push(TreeNode {
                     row: execution_row(execution, inventory),
                     children: Vec::new(),
                 });
@@ -2060,6 +2077,92 @@ mod tests {
                 .filter(|(_, id, _)| *id == RowId::Pane("wA:p3".into()))
                 .count(),
             1
+        );
+    }
+
+    fn execution_at(
+        registration: &str,
+        pane: &str,
+        ended: bool,
+    ) -> crate::model::ExecutionObservation {
+        crate::model::ExecutionObservation {
+            registration_id: crate::identity::RegistrationId::parse(registration)
+                .expect("registration"),
+            state: crate::control_plane::lifecycle::State::Bound,
+            origin: crate::model::ExecutionOrigin::Spawned,
+            placement: serde_json::from_value(serde_json::json!({
+                "location": {"backend": "tmux", "workspace": "wA", "tab": "wA:t1", "pane": pane}
+            }))
+            .expect("placement"),
+            subject_id: None,
+            claim_id: None,
+            reserved_claim_id: None,
+            process: None,
+            bound_registration_id: None,
+            session: None,
+            ended,
+        }
+    }
+
+    #[test]
+    fn a_registration_with_an_agent_and_an_execution_is_one_row() {
+        const R: &str = "00000000-0000-4000-8000-0000000000c1";
+        let mut state = two_agent_window(vec![registered_agent(R, "wA:p1", "wA:t1", None)]);
+        let mut inventory = state.inventory().expect("inventory").clone();
+        inventory.executions = vec![execution_at(R, "wA:p1", false)];
+        state.apply_success(inventory);
+        let rows = flatten(&FleetTree::build(&state));
+        let ours = rows
+            .iter()
+            .filter(|(_, id, _)| match id {
+                RowId::Lifecycle(registration) => registration.as_str() == R,
+                RowId::Agent(pane) => pane == "wA:p1",
+                _ => false,
+            })
+            .count();
+        assert_eq!(ours, 1, "one registration, one row: {rows:?}");
+    }
+
+    #[test]
+    fn an_ended_execution_leaves_its_surviving_pane_an_ordinary_pane() {
+        const R: &str = "00000000-0000-4000-8000-0000000000c2";
+        let mut state = two_agent_window(Vec::new());
+        let mut inventory = state.inventory().expect("inventory").clone();
+        inventory.executions = vec![execution_at(R, "wA:p1", true)];
+        state.apply_success(inventory);
+        let rows = flatten(&FleetTree::build(&state));
+        assert!(
+            rows.iter()
+                .any(|(_, id, _)| *id == RowId::Pane("wA:p1".into())),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_execution_sits_with_its_window_not_beside_the_workspace() {
+        const R: &str = "00000000-0000-4000-8000-0000000000c3";
+        let mut state = two_agent_window(vec![registered_agent(
+            "00000000-0000-4000-8000-0000000000c4",
+            "wA:p2",
+            "wA:t1",
+            None,
+        )]);
+        let mut inventory = state.inventory().expect("inventory").clone();
+        inventory.executions = vec![execution_at(R, "wA:p1", false)];
+        state.apply_success(inventory);
+        let tree = FleetTree::build(&state);
+        let rows = flatten(&tree);
+        let depth = |wanted: &RowId| {
+            rows.iter()
+                .find(|(_, id, _)| id == wanted)
+                .map(|(d, _, _)| *d)
+        };
+        assert_eq!(
+            depth(&RowId::Lifecycle(
+                crate::identity::RegistrationId::parse(R).unwrap()
+            )),
+            depth(&RowId::Agent("wA:p2".into())).map(|d| d + 1),
+            "the window's only agent is its tab and the execution is one of its panes: {rows:?}"
         );
     }
 
