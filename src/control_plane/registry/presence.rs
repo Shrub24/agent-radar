@@ -259,9 +259,8 @@ pub fn begin(
             return decision(registry, &reserved)?
                 .ok_or_else(|| "the reserved claim was not readable".into());
         }
-        // This registration came back as another session, so the intended
-        // continuation cannot happen. Settle it before the actual session is judged.
-        lifecycle::release_claim(registry, &reserved)?;
+        // A reservation for another session is settled below as the registration's
+        // previous attachment, so it is never fulfilled by a session it did not name.
     }
     if let Some(existing) = current(registry, registration_id)?
         && !existing.standing.is_terminal()

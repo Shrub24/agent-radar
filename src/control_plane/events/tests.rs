@@ -107,6 +107,51 @@ fn authority_and_granted_history_survive_reservation_and_replay() {
 }
 
 #[test]
+fn the_log_refuses_a_second_reservation_and_a_second_live_attachment() {
+    let fixture = Fixture::new();
+    let registry = fixture.registry();
+    let first = create(&registry);
+    let subject = first.subject_id.unwrap();
+    let held = first.claim_id.unwrap();
+    let other = lifecycle::create_with_intent(
+        &registry,
+        &random_uuid(),
+        launch(),
+        None,
+        None,
+        lifecycle::ManagedMetadata::default(),
+        2000,
+    )
+    .unwrap();
+    let mut log = registry.events.lock().unwrap();
+    let mut rival = log.facts(&held).unwrap();
+    rival.registration_id = other.registration_id;
+    assert!(
+        log.append(
+            Stream::Claim(&ClaimId::random()),
+            "2026-01-01T00:00:00Z",
+            Source::Registration,
+            Transition::Enrolled(Box::new(rival.clone()))
+        )
+        .unwrap_err()
+        .contains("reserved attachment")
+    );
+    let mut same_registration = log.facts(&held).unwrap();
+    same_registration.subject_id = Some(SubjectId::random());
+    assert!(
+        log.append(
+            Stream::Claim(&ClaimId::random()),
+            "2026-01-01T00:00:00Z",
+            Source::Registration,
+            Transition::Enrolled(Box::new(same_registration))
+        )
+        .unwrap_err()
+        .contains("registration already holds")
+    );
+    assert_eq!(log.reserved_claim(&subject), Some(held));
+}
+
+#[test]
 fn replay_refuses_two_grants_on_one_subject() {
     let fixture = Fixture::new();
     let registry = fixture.registry();

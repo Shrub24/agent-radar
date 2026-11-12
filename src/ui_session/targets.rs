@@ -118,7 +118,7 @@ pub(crate) fn describe(row: &crate::tree::RowId) -> String {
         crate::tree::RowId::Agent(pane) | crate::tree::RowId::Pane(pane) => format!("pane {pane}"),
         crate::tree::RowId::Registered(id) => format!("unresolved agent {id}"),
         crate::tree::RowId::Task(_) => "that task".to_string(),
-        crate::tree::RowId::Lifecycle(id) => format!("lifecycle subject {id}"),
+        crate::tree::RowId::Lifecycle(id) => format!("execution {id}"),
     }
 }
 
