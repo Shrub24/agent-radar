@@ -4118,6 +4118,69 @@ mod tests {
     }
 
     #[test]
+    fn a_successor_that_fails_after_the_predecessor_exited_leaves_the_subject_detached() {
+        use crate::control_plane::events::{Source, Transition};
+        let scratch = Scratch::new("successor-fails-after-exit");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("incumbent");
+        let incumbent = first.claim_id.clone().expect("claim");
+        let subject = first.subject_id.clone().expect("subject");
+        append_claim(
+            &registry,
+            &incumbent,
+            "2026-01-01T00:00:01.000Z",
+            Source::Registration,
+            Transition::Granted {
+                subject_id: subject.clone(),
+            },
+        )
+        .expect("grant");
+        let pending = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((subject.clone(), incumbent.clone())),
+            ManagedMetadata::default(),
+            2,
+        )
+        .expect("reservation");
+        let reserved = pending.claim_id.clone().expect("claim");
+        // The predecessor verifiably exits and releases; the successor then never launches.
+        registry
+            .events
+            .lock()
+            .unwrap()
+            .append(
+                crate::control_plane::events::Stream::Process(&first.registration_id),
+                "2026-01-01T00:00:03.000Z",
+                Source::ProcessObservation,
+                Transition::Captured(identity(5)),
+            )
+            .expect("capture");
+        let process = read_process(&registry, &first.registration_id)
+            .unwrap()
+            .unwrap();
+        record_exit(&registry, &process, 3).expect("verified exit");
+        release_claim(&registry, &reserved).expect("the failed successor is settled");
+        assert_eq!(
+            granted_claim(&registry, &subject).unwrap(),
+            None,
+            "an exited grant is never restored"
+        );
+        assert_eq!(reserved_claim(&registry, &subject).unwrap(), None);
+        let attachment = current_attachment(&registry, &subject).unwrap().unwrap();
+        assert_eq!(
+            attachment.claim_id, incumbent,
+            "the subject keeps its last granted attachment as history"
+        );
+        assert!(
+            !is_attached(&registry, &attachment, 4).unwrap(),
+            "and is detached"
+        );
+    }
+
+    #[test]
     fn a_registration_presenting_another_session_settles_its_own_mismatched_reservation() {
         use crate::control_plane::registry::presence::{Standing, begin, decision};
         let scratch = Scratch::new("own-reservation-mismatch");
