@@ -757,6 +757,10 @@ fn execution_row(
         Some(label) => format!("{state} · {who} · {}", crate::title::display(&label, None)),
         None => format!("{state} · {who}"),
     };
+    let title = match &execution.failed_intent {
+        Some(_) => format!("{title} · intent failed"),
+        None => title,
+    };
     TreeRow {
         id: RowId::Lifecycle(execution.registration_id.clone()),
         kind: RowKind::Lifecycle(Box::new(LifecycleRow {
@@ -2094,7 +2098,16 @@ mod tests {
             bound_registration_id: None,
             session: None,
             ended,
+            failed_intent: None,
         }
+    }
+
+    #[test]
+    fn a_failed_intent_is_named_on_the_execution_row() {
+        let mut execution = execution_at("00000000-0000-4000-8000-0000000000c9", "wA:p1", false);
+        execution.failed_intent = Some("the intended session did not present".into());
+        let row = execution_row(&execution, &FleetObservation::default());
+        assert!(row.title().contains("intent failed"), "{}", row.title());
     }
 
     #[test]
@@ -2187,6 +2200,7 @@ mod tests {
             bound_registration_id: None,
             session: None,
             ended: false,
+            failed_intent: None,
         };
         let attached = crate::model::ExecutionObservation {
             registration_id: registration(0xa2),
@@ -2207,6 +2221,7 @@ mod tests {
             bound_registration_id: None,
             session: Some("session".into()),
             ended: false,
+            failed_intent: None,
         };
         // Revoked before it ever presented: no process, no attachment, no row.
         let revoked = crate::model::ExecutionObservation {
@@ -2221,6 +2236,7 @@ mod tests {
             bound_registration_id: None,
             session: None,
             ended: false,
+            failed_intent: None,
         };
         let observation = FleetObservation {
             executions: vec![subjectless.clone(), attached.clone(), revoked],

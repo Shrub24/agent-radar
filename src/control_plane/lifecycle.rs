@@ -1406,6 +1406,27 @@ pub fn release_claim(registry: &Registry, claim_id: &ClaimId) -> Result<(), Stri
     )
 }
 
+/// Ends an attachment that was meant to happen but could not, recording why so the
+/// operator sees the failed restart or continuation. Idempotent like a release.
+pub fn fail_claim(registry: &Registry, claim_id: &ClaimId, reason: &str) -> Result<(), String> {
+    let standing = {
+        let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+        log.facts(claim_id).map(|facts| facts.standing)
+    };
+    if standing.is_none_or(|standing| standing.is_terminal()) {
+        return Ok(());
+    }
+    append_claim(
+        registry,
+        claim_id,
+        &crate::control_plane::store::now(),
+        crate::control_plane::events::Source::Registration,
+        crate::control_plane::events::Transition::Failed {
+            reason: reason.to_string(),
+        },
+    )
+}
+
 /// Records that this claim's session presented while it only held its subject.
 pub fn claim_presence(
     registry: &Registry,
@@ -1521,6 +1542,7 @@ pub fn admit_claim(
         managed: execution.managed.clone(),
         standing,
         granted_at: None,
+        failure: None,
     };
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
     ensure_process(registry, &mut log, &execution)?;
@@ -4221,6 +4243,26 @@ mod tests {
             "the intended session is retained as the failed intent"
         );
         assert_eq!(reserved_claim(&registry, &subject).unwrap(), None);
+        let published =
+            crate::control_plane::registry_read::read(&registry, None, 4).expect("publication");
+        let row = published
+            .executions
+            .iter()
+            .find(|row| row.registration_id == ticket.registration_id)
+            .expect("the execution is published");
+        assert!(
+            row.failed_intent.is_some(),
+            "the failed intent is published for the TUI"
+        );
+        let other = published
+            .executions
+            .iter()
+            .filter(|row| row.failed_intent.is_some())
+            .count();
+        assert_eq!(
+            other, 1,
+            "only the execution whose intent failed reports it"
+        );
     }
 
     #[test]

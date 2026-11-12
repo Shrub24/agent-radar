@@ -61,6 +61,7 @@ unknown = "diamond"
         bound_registration_id: None,
         session: None,
         ended: false,
+        failed_intent: None,
     });
     let mut state = ObservationState::new();
     state.apply_success(observation);

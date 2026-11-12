@@ -116,6 +116,10 @@ pub struct AttachmentFacts {
     /// held its subject. Set once; a later release does not clear it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<String>,
+    /// Why this attachment ended without ever being fulfilled, when it was an
+    /// intended restart or continuation that could not happen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 /// One registration's public process evidence. Recipes and captured environment
@@ -158,6 +162,7 @@ impl AttachmentFacts {
             // writing an attachment: this baseline describes the facts.
             standing: Standing::Pending,
             granted_at: None,
+            failure: None,
         }
     }
 }
@@ -273,6 +278,10 @@ pub enum Transition {
     },
     /// Ends this claim's authority, keeping it as the record of what it was.
     Released,
+    /// Ends an intended attachment that could not happen, recording why.
+    Failed {
+        reason: String,
+    },
     OperationAdmitted(RequestRecord),
     OperationStarted(RequestRecord),
     OperationSettled(RequestRecord),
@@ -919,6 +928,10 @@ fn reduce_attachment(
         }
         Transition::Released if !facts.standing.is_terminal() => {
             facts.standing = Standing::Released;
+        }
+        Transition::Failed { reason } if !facts.standing.is_terminal() => {
+            facts.standing = Standing::Released;
+            facts.failure = Some(reason.clone());
         }
         _ => return Err("invalid lifecycle transition".into()),
     }

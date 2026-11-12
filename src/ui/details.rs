@@ -730,6 +730,9 @@ pub(super) fn overview_lines(
                 page.push(line);
             }
             page.push(field("agent", registration_identifier(agent)));
+            if let Some(reason) = failed_intent(state, agent) {
+                page.push(field("intended attachment failed", sanitize(&reason)));
+            }
             container_fields(agent.container.as_ref(), page);
             match &agent.registry {
                 Some(view) => registry_lines(state, agent, view, page),
@@ -765,6 +768,9 @@ pub(super) fn overview_lines(
                 },
             ));
             page.push(field("registration", execution.registration_id.to_string()));
+            if let Some(reason) = &execution.failed_intent {
+                page.push(field("intended attachment failed", sanitize(reason)));
+            }
             page.push(field(
                 "subject",
                 execution
@@ -840,6 +846,19 @@ pub(super) fn registration_identifier(agent: &AgentRow) -> String {
 /// stands, what it last executed, what its owner assigned, its own facts, and the
 /// state derived from them. Each carries its own freshness, so an expired report
 /// reads as stale rather than as the state it last described.
+/// Why the restart or continuation that launched this agent's process did not
+/// attach, read from the execution the daemon published for its registration.
+fn failed_intent(state: &ObservationState, agent: &AgentRow) -> Option<String> {
+    let registration = &agent.registry.as_ref()?.agent.registration.registration_id;
+    state
+        .inventory()?
+        .executions
+        .iter()
+        .find(|execution| &execution.registration_id == registration)?
+        .failed_intent
+        .clone()
+}
+
 pub(super) fn registry_lines(
     state: &ObservationState,
     agent: &AgentRow,

@@ -295,7 +295,7 @@ Radar mints the claim id a successor holds, including the reserved claim a resta
 
 **Rejected alternative:** keep client-minted ids and drop reservations. Rejected: a restart must name its successor before it exists, which is what reservation is for.
 
-**Consequence:** a client that presents a stale or mismatched claim against a reserved registration is refused rather than served the reservation, and the reservation stays readable by its own registration until it is fulfilled or withdrawn.
+**Consequence:** a named claim that does not match is refused. A registration presenting another session than its own reservation intended does not fulfil it: the reservation is settled as a failed intent (see "A reservation that cannot be fulfilled fails its intent, visibly") and the presented session attaches under the ordinary rules.
 
 ## The event log's lock is never held across a read of claims
 
@@ -323,7 +323,7 @@ Radar mints the claim id a successor holds, including the reserved claim a resta
 **Verification:** corroborated — `a_claimless_report_recovers_the_attachment_it_already_made` fails with the discovery branch disabled, and `a_session's_shutdown_completes_its_release_before_the_next_session_starts` fails when the hook wrapper discards its handler's promise
 **Revisit when:** a client needs to present on a claim before the daemon has resolved the registration, or a session-start reason decides whether a reload deserves a new claim
 
-A presence report carries the process and the session; the claim id it names is optional and only ever one Radar answered with earlier. A claimless report resolves the registration's reservation, else its live claim for that same session, else mints one. A named claim resumes that attachment, is refused if it has been released, and is refused if it names a different session than the one the registration holds.
+A presence report carries the process and the session; the claim id it names is optional and only ever one Radar answered with earlier. A claimless report resolves the registration's reservation, else its live claim for that same session, else releases the claim the registration still holds for a previous session and mints a new one. A named claim resumes that attachment, is refused if it has been released, and is refused if it names a different session than the one the registration holds.
 
 **Reason:** while the client minted the id, the reserved claim a restart created could never be fulfilled — the daemon installed the client's id as a second pending claim and the reservation survived as an orphan. Client-minted identity also meant "the daemon returned an answer" and "the client persisted it" could disagree with no way to tell which was current.
 
@@ -331,7 +331,7 @@ A presence report carries the process and the session; the claim id it names is 
 
 **Rejected alternative:** accept whatever claim id a report names, including an unrecorded one. Rejected: an attachment identity that any caller can invent is not an identity, and the daemon cannot then tell a retry from a new attachment.
 
-**Consequence:** a lost first reply is recovered by reporting again, which is why the claimless path must be idempotent per (registration, session) — that idempotence is the recovery story, not a retry token. The lifecycle boundary is therefore load-bearing: Pi awaits a handler's return value, so the extension's hook wrapper must return its handler's promise or the next session starts before the previous release lands. A session-start reason is context only; nothing branches on it yet, so no field is carried.
+**Consequence:** a lost first reply is recovered by reporting again, which is why the claimless path must be idempotent while an attachment is live for (registration, session) — that idempotence is the recovery story, not a retry token. A released claim is never reopened, so a same-session reload after a shutdown gets a new claim. The lifecycle boundary is therefore load-bearing: Pi awaits a handler's return value, so the extension's hook wrapper must return its handler's promise or the next session starts before the previous release lands. A session-start reason is context only; nothing branches on it yet, so no field is carried.
 
 ## An exit settles the attachments it held; a claimant never reconciles
 
@@ -386,3 +386,48 @@ A claim's recorded facts are its registration, subject, managed metadata, sessio
 **Rejected alternative:** keep the copy and synchronise it more carefully. Rejected: a second copy of a fact is a second answer to the same question, and the synchroniser had no consumer that could not read the execution directly.
 
 **Consequence:** a claim transition now validates itself against the execution rather than mutating it, so `Granted`, `Presence` and `Reserved` consult the execution record to refuse an ended one — the guard survives without the copy. Execution transitions validate their own preconditions, which is why `Placed`, `AbsencePending` and `EndedExternally` keep their original refusals.
+
+## A reservation that cannot be fulfilled fails its intent, visibly
+
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer ruling "record the intended restart as failed, allow ordinary attachment to the actual session, error on tui, no automatic retry for now", 2026-11-09
+**Verification:** corroborated — `a_registration_presenting_another_session_settles_its_own_mismatched_reservation` fails with the settlement removed; the intent is published on the execution
+
+A registration whose own reservation named one session but which presented another settles that reservation with a recorded reason (`Transition::Failed`) and is then evaluated as an ordinary attachment. The reason is published on the execution as `failed_intent` and the TUI names it on the row and in details. Effects that succeeded (the stop, the launch) are not rewritten. A reservation held for another registration is an exclusion conflict that this registration never clears.
+
+**Reason:** leaving the reservation in place stranded the session that actually came back; silently overwriting its intended session lost the evidence that the restart did not happen.
+
+**Rejected alternative:** refuse the mismatched presentation. Rejected: the actual session is blocked until the reservation's deadline.
+
+**Rejected alternative:** a general "process failed" claim standing. Rejected: the execution did not fail, only the intended attachment.
+
+**Consequence:** no automatic retry. A retry mechanism is future work and would consume `failed_intent`.
+
+## Claim authority is a maintained cache over the claim log
+
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer ruling "the index is just the cache; the claim is the source of truth", 2026-11-09
+**Verification:** corroborated — the one-reservation and one-live-attachment guards each fail `the_log_refuses_a_second_reservation_and_a_second_live_attachment` when removed, and the one-grant guard fails `replay_refuses_two_grants_on_one_subject`
+
+A subject's grant, its exclusive reservation, its most recently granted claim and each registration's attachment are indexes the log maintains as it appends and rebuilds on replay. Writes and replay share the invariants, so an inconsistent journal is refused when it is opened rather than resolved by choosing a winner. Cancelling a reservation does not change granted history.
+
+**Reason:** every reader previously rebuilt ownership by scanning and sorting claims, with different rules in different places.
+
+**Rejected alternative:** persist authority pointers or index files. Rejected: that reintroduces multi-file consistency and a repair story.
+
+## The pane names its live occupant; rows do not join
+
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer ruling "I would make the Pane own the process ref itself", 2026-11-10; earlier agreement that topology panes carry the registration link
+**Verification:** corroborated — `a_pane_names_the_one_live_execution_that_holds_it`, and the tree test `a_registration_with_an_agent_and_an_execution_is_one_row` fails when the agent-represented dedupe is removed
+
+`Pane.registration_id` is resolved once in the collector from each execution's recorded placement. An ended or withdrawn execution occupies nothing; of two live executions on one pane the attached one wins. Placement stays recorded once on the execution.
+
+**Reason:** the earlier client-side join by placement duplicated rows, chose an execution by key order and could not know the serving generation.
+
+**Rejected alternative:** key every row by registration. Rejected: a restart reuses the pane and creates a new registration, so a registration-keyed row changes identity at each restart.
+
+**Revisit when:** occupancy needs the serving instance — the collector would compare each placement's instance with the server now serving, once its per-refresh cost is measured. Until then destructive effects stay fenced by their own instance checks.

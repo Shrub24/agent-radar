@@ -55,6 +55,26 @@ The default view SHALL show each included registration once, enriched by optiona
 - **WHEN** a retained subject has no registration included by the default view
 - **THEN** it does not create a default execution row
 
+#### Scenario: The pane names its occupant
+- **WHEN** a live execution's recorded placement names a pane
+- **THEN** the published pane names that registration as its occupant, resolved once by the collector, and rows read it rather than re-deriving occupancy
+
+#### Scenario: An ended execution leaves an ordinary pane
+- **WHEN** the execution placed in a pane has ended or was withdrawn before presenting
+- **THEN** the pane names no occupant and remains an ordinary pane row
+
+#### Scenario: A successor and its predecessor name one pane
+- **WHEN** two live executions are placed in one pane
+- **THEN** the pane's occupant is the one holding an attachment, deterministically, not the one that sorts first by key
+
+#### Scenario: A launch that has not presented is closed through its pane
+- **WHEN** the operator closes the row of a placed execution that has no agent registration yet
+- **THEN** the ordinary fenced pane close is requested for its pane
+
+#### Scenario: A failed intended attachment is published
+- **WHEN** a registration's own reservation was settled because another session presented
+- **THEN** its execution observation carries the failure reason, and the TUI names it on the row and in details
+
 ### Requirement: Execution row composition does not create another state owner
 The execution row record SHALL be a derived join of registration, optional claim, optional subject and placement. It SHALL NOT be a persisted row store or independently maintained placement authority. A topology link SHALL NOT bypass backend-generation verification.
 

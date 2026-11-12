@@ -1703,6 +1703,12 @@ export interface ExecutionObservation {
    * Whether the daemon recorded this execution's process as ended.
    */
   ended: boolean;
+  /**
+   * Why an intended restart or continuation of this execution failed, when it
+   * did. The execution and its effects are untouched; only the intended
+   * attachment failed.
+   */
+  failed_intent?: string | null;
   origin: ExecutionOrigin;
   /**
    * Where this execution runs, as the daemon recorded it when it verified the

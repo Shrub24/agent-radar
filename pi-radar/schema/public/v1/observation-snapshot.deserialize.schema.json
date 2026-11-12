@@ -459,6 +459,13 @@
           "description": "Whether the daemon recorded this execution's process as ended.",
           "type": "boolean"
         },
+        "failed_intent": {
+          "description": "Why an intended restart or continuation of this execution failed, when it\ndid. The execution and its effects are untouched; only the intended\nattachment failed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "origin": {
           "$ref": "#/$defs/ExecutionOrigin"
         },

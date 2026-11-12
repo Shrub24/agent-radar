@@ -653,6 +653,11 @@ pub struct ExecutionObservation {
     /// Whether the daemon recorded this execution's process as ended.
     #[serde(default)]
     pub ended: bool,
+    /// Why an intended restart or continuation of this execution failed, when it
+    /// did. The execution and its effects are untouched; only the intended
+    /// attachment failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_intent: Option<String>,
 }
 
 impl ExecutionObservation {

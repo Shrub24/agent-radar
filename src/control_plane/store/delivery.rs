@@ -90,6 +90,7 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::Granted { .. } => "lifecycle.granted",
         Transition::Duplicate { .. } => "lifecycle.duplicate",
         Transition::Released => "lifecycle.released",
+        Transition::Failed { .. } => "lifecycle.failed",
         Transition::ContainerCreated(_) => "container.created",
         Transition::ContainerObserved(_) => "container.observed",
         Transition::ContainerRemoved => "container.removed",

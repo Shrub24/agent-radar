@@ -259,8 +259,11 @@ pub fn begin(
             return decision(registry, &reserved)?
                 .ok_or_else(|| "the reserved claim was not readable".into());
         }
-        // A reservation for another session is settled below as the registration's
-        // previous attachment, so it is never fulfilled by a session it did not name.
+        lifecycle::fail_claim(
+            registry,
+            &reserved,
+            "the intended session did not present; another session came back on the launched process",
+        )?;
     }
     if let Some(existing) = current(registry, registration_id)?
         && !existing.standing.is_terminal()
