@@ -159,9 +159,20 @@ pub(crate) fn selection(kind: &RowKind, represents_tab: Option<&str>) -> Selecte
             Selected::Refused("a workspace is not a close target: close a pane or its tab")
         }
         RowKind::Task(_) => Selected::Refused("a background task is not a close target"),
-        RowKind::Lifecycle(_) => {
-            Selected::Refused("a lifecycle status entry is not a pane close target")
-        }
+        // A launch that has not presented has no agent row, but its pane is the
+        // place the operator sees; closing it is the ordinary fenced pane close.
+        RowKind::Lifecycle(lifecycle) => match lifecycle.execution.occupied_pane() {
+            Some(pane_id) => Selected::Pane {
+                pane_id: pane_id.to_string(),
+                tab: None,
+                losses: vec![format!(
+                    "execution {} ({})",
+                    &lifecycle.execution.registration_id.as_str()[..8],
+                    lifecycle.title
+                )],
+            },
+            None => Selected::Refused("this execution holds no pane to close"),
+        },
     }
 }
 
@@ -859,6 +870,31 @@ mod tests {
         assert!(
             params.pointer("/request/force").is_none(),
             "consent is the confirmation the operator gave, never a request field"
+        );
+    }
+
+    #[test]
+    fn a_launch_that_has_not_presented_closes_through_its_pane() {
+        let execution: crate::model::ExecutionObservation = serde_json::from_value(serde_json::json!({
+            "registration_id": "00000000-0000-4000-8000-0000000000d1",
+            "state": "pending", "origin": "spawned", "ended": false,
+            "placement": {"location": {"backend": "tmux", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"}}
+        })).unwrap();
+        let row = |execution| {
+            RowKind::Lifecycle(Box::new(crate::tree::LifecycleRow {
+                execution,
+                title: "pending".into(),
+            }))
+        };
+        match selection(&row(execution.clone()), None) {
+            Selected::Pane { pane_id, .. } => assert_eq!(pane_id, "wA:p1"),
+            other => panic!("{other:?}"),
+        }
+        let mut ended = execution;
+        ended.ended = true;
+        assert!(
+            matches!(selection(&row(ended), None), Selected::Refused(_)),
+            "an ended execution holds no pane"
         );
     }
 

@@ -622,6 +622,7 @@ mod tests {
             label: None,
             title: None,
             current_path: None,
+            registration_id: None,
         }
     }
 

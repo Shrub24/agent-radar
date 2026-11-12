@@ -130,6 +130,7 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                 label: None,
                 title: None,
                 current_path: None,
+                registration_id: None,
             })
             .collect(),
         agents: agents
@@ -1864,6 +1865,7 @@ fn wa_inventory(pane_ids: &[&str]) -> FleetObservation {
                 label: None,
                 title: None,
                 current_path: None,
+                registration_id: None,
             })
             .collect(),
         agents: Vec::new(),

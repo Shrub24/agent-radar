@@ -1766,6 +1766,12 @@ export interface Pane {
   current_path?: string | null;
   label: string | null;
   location: Location;
+  /**
+   * The live registration occupying this pane, resolved once by the collector
+   * from the daemon's recorded placement. Rows read it; they do not re-derive
+   * occupancy, and an ended execution never occupies a pane.
+   */
+  registration_id?: string | null;
   title: string | null;
 }
 /**

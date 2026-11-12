@@ -489,6 +489,7 @@ fn collect(
     observation.containers = containers;
     observation.lifecycle_subjects = lifecycle_subjects;
     observation.executions = executions;
+    observation.resolve_occupants();
     stamp_assignment_ages(&mut observation);
     RefreshOutcome::Success {
         observation: Box::new(observation),

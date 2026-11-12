@@ -123,9 +123,23 @@ Revoked executions that never presented are hidden from the default view for now
 
 A derived row record composes the registration, optional claim, optional subject
 and placement. It is a view, not a durable row store or another owner of placement.
-Topology links may name registrations; joins must still validate placement's
-backend generation. Choose the concrete public DTO layout during implementation
-without publishing competing authoritative placement copies.
+The observation's pane names the live registration occupying it. The collector
+resolves that once from each execution's recorded placement
+(`FleetObservation::resolve_occupants`) and rows read it; no consumer re-derives
+occupancy. Placement stays recorded once, on the execution: the pane's reference is
+computed at publication, never stored. An ended or withdrawn execution occupies
+nothing, so the shell it leaves is an ordinary pane. When two live executions name
+one pane (a restart's successor beside its predecessor) the one holding an
+attachment occupies it, then the greater registration id, so the answer is
+deterministic. Executions with no pane stay rows of their own.
+
+Rationale: a client-side join by placement could not know the serving backend
+generation, duplicated rows and picked an execution by key order. The collector
+already holds both sources. Known limit: occupancy is not yet qualified by the
+serving server instance, because that costs a verifier call per refresh and has
+not been measured; destructive effects stay fenced by their instance checks at
+dispatch. A closed pane's row is the pane; closing a launch that has not presented
+is the ordinary fenced pane close.
 
 First presence enriches the same registration row instead of merging a subject row
 and a pane row. A claim contributes state and authority, not another display unit.

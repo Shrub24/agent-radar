@@ -2312,6 +2312,7 @@ mod tests {
                 label: None,
                 title: None,
                 current_path: None,
+                registration_id: None,
             }],
             agents: vec![AgentObservation {
                 location: Location {
@@ -2480,6 +2481,7 @@ mod tests {
                 label: None,
                 title: None,
                             current_path: None,
+                            registration_id: None,
             }],
             agents: vec![AgentObservation {
                 location,

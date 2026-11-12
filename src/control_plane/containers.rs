@@ -985,6 +985,7 @@ mod tests {
                 label: None,
                 title: None,
                 current_path: None,
+                registration_id: None,
             }],
             agents: Vec::new(),
             containers: Vec::new(),

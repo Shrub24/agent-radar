@@ -361,6 +361,7 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
                 label: None,
                 title: None,
                 current_path: None,
+                registration_id: None,
             })
             .collect(),
         agents: occupants
@@ -815,6 +816,7 @@ impl MuxBackend {
                         label: None,
                         title: None,
                         current_path: None,
+                        registration_id: None,
                     })
                     .collect(),
                 agents: Vec::new(),
@@ -1316,6 +1318,7 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
             label: Some("editor".into()),
             title: Some("nvim".into()),
             current_path: None,
+            registration_id: None,
         }],
         agents: vec![AgentObservation {
             location,
@@ -11248,6 +11251,7 @@ fn workspace_with_a_pane(workspace_id: &str) -> FleetObservation {
         label: None,
         title: None,
         current_path: None,
+        registration_id: None,
     }];
     inventory
 }
@@ -12093,6 +12097,7 @@ fn a_servers_own_places_are_adopted_as_observed_containers() {
             label: None,
             title: None,
             current_path: None,
+            registration_id: None,
         }],
         ..FleetObservation::default()
     };

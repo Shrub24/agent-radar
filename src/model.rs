@@ -189,6 +189,11 @@ pub struct Pane {
     /// Current tmux pane directory, used as the target for a new launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_path: Option<String>,
+    /// The live registration occupying this pane, resolved once by the collector
+    /// from the daemon's recorded placement. Rows read it; they do not re-derive
+    /// occupancy, and an ended execution never occupies a pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<crate::identity::RegistrationId>,
 }
 
 impl Pane {
@@ -648,6 +653,56 @@ pub struct ExecutionObservation {
     /// Whether the daemon recorded this execution's process as ended.
     #[serde(default)]
     pub ended: bool,
+}
+
+impl ExecutionObservation {
+    /// Revoked before it ever presented: it names no process and holds no
+    /// attachment, so the default view has nothing to show for it.
+    pub fn is_withdrawn_launch(&self) -> bool {
+        self.state == LifecycleState::Revoked && self.process.is_none() && self.subject_id.is_none()
+    }
+
+    /// The pane this execution occupies now. An ended or withdrawn execution
+    /// occupies nothing: the pane it leaves behind is whatever is in it next.
+    pub fn occupied_pane(&self) -> Option<&str> {
+        if self.ended || self.is_withdrawn_launch() {
+            return None;
+        }
+        self.placement.as_ref()?.pane()
+    }
+}
+
+impl FleetObservation {
+    /// Names, on each pane, the live registration the daemon placed there. When
+    /// more than one live execution claims a pane, the one holding an attachment
+    /// wins, so a restart's successor and its predecessor never tie by id order.
+    pub fn resolve_occupants(&mut self) {
+        let mut occupants: std::collections::HashMap<&str, &ExecutionObservation> =
+            std::collections::HashMap::new();
+        for execution in &self.executions {
+            let Some(pane) = execution.occupied_pane() else {
+                continue;
+            };
+            let rank =
+                |e: &ExecutionObservation| (e.claim_id.is_some(), e.reserved_claim_id.is_some());
+            match occupants.get(pane) {
+                Some(held)
+                    if (rank(held), &held.registration_id)
+                        >= (rank(execution), &execution.registration_id) => {}
+                _ => {
+                    occupants.insert(pane, execution);
+                }
+            }
+        }
+        let resolved: std::collections::HashMap<String, crate::identity::RegistrationId> =
+            occupants
+                .into_iter()
+                .map(|(pane, execution)| (pane.to_owned(), execution.registration_id.clone()))
+                .collect();
+        for pane in &mut self.panes {
+            pane.registration_id = resolved.get(pane.location.pane_id.as_str()).cloned();
+        }
+    }
 }
 
 /// How an execution came to be tracked.
@@ -1135,6 +1190,58 @@ impl ForegroundEvidence {
 #[cfg(test)]
 mod tests {
     use super::{AgentObservation, HerdsmanFacts, Location, RuntimeStatus, SemanticState};
+
+    fn execution(
+        registration: u8,
+        pane: &str,
+        claim: bool,
+        ended: bool,
+    ) -> super::ExecutionObservation {
+        serde_json::from_value(serde_json::json!({
+            "registration_id": format!("00000000-0000-4000-8000-0000000000{registration:02x}"),
+            "state": "bound", "origin": "spawned", "ended": ended,
+            "claim_id": claim.then(|| format!("00000000-0000-4000-8000-0000000001{registration:02x}")),
+            "placement": {"location": {"backend": "tmux", "workspace": "w", "tab": "t", "pane": pane}}
+        })).unwrap()
+    }
+
+    #[test]
+    fn a_pane_names_the_one_live_execution_that_holds_it() {
+        let pane = |id: &str| super::Pane {
+            location: Location {
+                workspace_id: "w".into(),
+                tab_id: "t".into(),
+                pane_id: id.into(),
+            },
+            label: None,
+            title: None,
+            current_path: None,
+            registration_id: None,
+        };
+        let mut fleet = super::FleetObservation {
+            panes: vec![pane("p1"), pane("p2"), pane("p3")],
+            executions: vec![
+                execution(1, "p1", false, false), // restart successor, not yet granted
+                execution(2, "p1", true, false),  // the incumbent holds the attachment
+                execution(3, "p2", true, true),   // ended: the shell it left is just a pane
+            ],
+            ..Default::default()
+        };
+        fleet.resolve_occupants();
+        let occupant = |i: usize| {
+            fleet.panes[i]
+                .registration_id
+                .as_ref()
+                .map(|r| r.as_str()[r.as_str().len() - 2..].to_string())
+        };
+        assert_eq!(
+            occupant(0).as_deref(),
+            Some("02"),
+            "the attached execution holds a contested pane"
+        );
+        assert_eq!(occupant(1), None, "an ended execution occupies nothing");
+        assert_eq!(occupant(2), None);
+    }
 
     fn facts(model: &str, provider: &str) -> HerdsmanFacts {
         HerdsmanFacts {

@@ -1599,6 +1599,13 @@
         "location": {
           "$ref": "#/$defs/Location"
         },
+        "registration_id": {
+          "description": "The live registration occupying this pane, resolved once by the collector\nfrom the daemon's recorded placement. Rows read it; they do not re-derive\noccupancy, and an ended execution never occupies a pane.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "title": {
           "type": [
             "string",

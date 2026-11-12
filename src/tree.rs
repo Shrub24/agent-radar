@@ -598,21 +598,16 @@ impl FleetTree {
         // pane record appears at most once (first record wins). A pane that hosts
         // an execution Radar tracks is that execution's row: one row per pane, and
         // no separate plain-pane row beside it.
-        let mut by_pane: HashMap<&str, &crate::model::ExecutionObservation> = HashMap::new();
-        // An ended execution does not occupy its pane: the shell it left behind is
-        // an ordinary pane again, and the ended execution is history.
-        for execution in &inventory.executions {
-            if execution.ended || represented.contains(&execution.registration_id) {
-                continue;
-            }
-            if let Some(pane) = execution
-                .placement
-                .as_ref()
-                .and_then(|placement| placement.pane())
-            {
-                by_pane.entry(pane).or_insert(execution);
-            }
-        }
+        // The collector resolves which live execution occupies a pane; the tree
+        // reads that and never re-derives occupancy.
+        let executions: HashMap<
+            &crate::identity::RegistrationId,
+            &crate::model::ExecutionObservation,
+        > = inventory
+            .executions
+            .iter()
+            .map(|e| (&e.registration_id, e))
+            .collect();
         let mut pane_seen: HashSet<&str> = HashSet::new();
         for pane in &inventory.panes {
             let pane_id = pane.location.pane_id.as_str();
@@ -622,8 +617,11 @@ impl FleetTree {
             let Some(&root_index) = workspace_index.get(pane.location.workspace_id.as_str()) else {
                 continue; // workspace_id_order covers every pane workspace
             };
-            if let Some(execution) = by_pane.get(pane_id).copied()
-                && !hidden(execution)
+            if let Some(execution) = pane
+                .registration_id
+                .as_ref()
+                .and_then(|registration| executions.get(registration).copied())
+                .filter(|execution| !represented.contains(&execution.registration_id))
             {
                 represented.insert(&execution.registration_id);
                 let window = (
@@ -699,7 +697,7 @@ impl FleetTree {
         // presented, one whose pane this refresh did not report, or one that has
         // already ended. A subject with no execution produces no row here.
         for execution in &inventory.executions {
-            if represented.contains(&execution.registration_id) || hidden(execution) {
+            if represented.contains(&execution.registration_id) || execution.is_withdrawn_launch() {
                 continue;
             }
             roots.push(TreeNode {
@@ -724,14 +722,6 @@ impl FleetTree {
             attach_node_tasks(node, bus);
         }
     }
-}
-
-/// Whether an execution is history that the default view hides: revoked before it
-/// ever presented, so it names no process and holds no attachment.
-fn hidden(execution: &crate::model::ExecutionObservation) -> bool {
-    execution.state == crate::control_plane::lifecycle::State::Revoked
-        && execution.process.is_none()
-        && execution.subject_id.is_none()
 }
 
 /// One row for one execution, joined to the attachment it holds or is waiting for.
@@ -1447,6 +1437,7 @@ mod tests {
                 label: None,
                 title: None,
                 current_path: None,
+                registration_id: None,
             }],
             agents: Vec::new(),
             containers: vec![
@@ -1532,6 +1523,7 @@ mod tests {
             label: None,
             title: None,
             current_path: None,
+            registration_id: None,
         }
     }
 
@@ -1898,6 +1890,7 @@ mod tests {
                     label: None,
                     title: None,
                     current_path: None,
+                    registration_id: None,
                 })
                 .collect(),
             agents: vec![
@@ -2110,6 +2103,7 @@ mod tests {
         let mut state = two_agent_window(vec![registered_agent(R, "wA:p1", "wA:t1", None)]);
         let mut inventory = state.inventory().expect("inventory").clone();
         inventory.executions = vec![execution_at(R, "wA:p1", false)];
+        inventory.resolve_occupants();
         state.apply_success(inventory);
         let rows = flatten(&FleetTree::build(&state));
         let ours = rows
@@ -2129,6 +2123,7 @@ mod tests {
         let mut state = two_agent_window(Vec::new());
         let mut inventory = state.inventory().expect("inventory").clone();
         inventory.executions = vec![execution_at(R, "wA:p1", true)];
+        inventory.resolve_occupants();
         state.apply_success(inventory);
         let rows = flatten(&FleetTree::build(&state));
         assert!(
@@ -2149,6 +2144,7 @@ mod tests {
         )]);
         let mut inventory = state.inventory().expect("inventory").clone();
         inventory.executions = vec![execution_at(R, "wA:p1", false)];
+        inventory.resolve_occupants();
         state.apply_success(inventory);
         let tree = FleetTree::build(&state);
         let rows = flatten(&tree);

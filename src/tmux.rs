@@ -1054,6 +1054,7 @@ impl TmuxRuntime {
                 label: None,
                 title: text_field(title),
                 current_path: text_field(current_path),
+                registration_id: None,
             });
         }
         Ok(panes)

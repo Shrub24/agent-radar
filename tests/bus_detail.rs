@@ -123,6 +123,7 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
                 label: None,
                 title: None,
                 current_path: None,
+                registration_id: None,
             })
             .collect(),
         agents: agents
