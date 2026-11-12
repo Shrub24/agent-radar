@@ -1118,10 +1118,7 @@ pub fn granted_claim(
     subject_id: &SubjectId,
 ) -> Result<Option<ClaimId>, String> {
     let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(log
-        .claims_of_subject(subject_id)
-        .find(|(_, facts)| facts.standing.grants_authority())
-        .map(|(claim, _)| claim))
+    Ok(log.granted_claim(subject_id))
 }
 
 /// The claim this registration reserved for a subject before it presented, so a
@@ -1131,15 +1128,10 @@ pub fn reservation_for(
     registration_id: &RegistrationId,
 ) -> Result<Option<ClaimId>, String> {
     let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(log
-        .claims_of_registration(registration_id)
-        .find(|(_, facts)| {
-            matches!(
-                facts.standing,
-                crate::control_plane::events::Standing::Reserved
-            )
-        })
-        .map(|(claim, _)| claim))
+    Ok(log.claim_of_registration(registration_id).filter(|claim| {
+        log.facts(claim)
+            .is_some_and(|facts| facts.standing.reserves_attachment() && facts.subject_id.is_some())
+    }))
 }
 
 /// The claim a subject is held for, if any launch reserved it.
@@ -1148,15 +1140,7 @@ pub fn reserved_claim(
     subject_id: &SubjectId,
 ) -> Result<Option<ClaimId>, String> {
     let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(log
-        .claims_of_subject(subject_id)
-        .find(|(_, facts)| {
-            matches!(
-                facts.standing,
-                crate::control_plane::events::Standing::Reserved
-            )
-        })
-        .map(|(claim, _)| claim))
+    Ok(log.reserved_claim(subject_id))
 }
 
 /// Resolve a subject's current attachment: the claim that holds it now, else the
@@ -1172,23 +1156,7 @@ pub fn current_attachment(
 ) -> Result<Option<Claim>, String> {
     let newest = {
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-        let mut last = None;
-        let mut live = None;
-        let mut granted = None;
-        for (claim, facts) in log.claims_of_subject(subject_id) {
-            if last.is_none() {
-                last = Some(claim.clone());
-            }
-            // A reservation excludes competitors without displacing the claim that
-            // holds the subject now, so the grant outranks a newer reservation.
-            if granted.is_none() && facts.standing.grants_authority() {
-                granted = Some(claim.clone());
-            }
-            if live.is_none() && !facts.standing.is_terminal() {
-                live = Some(claim.clone());
-            }
-        }
-        granted.or(live).or(last)
+        log.attachment(subject_id)
     };
     match newest {
         Some(claim) => read_claim(registry, &claim),
@@ -4090,7 +4058,10 @@ mod tests {
             None,
             Some((
                 incumbent.subject_id.clone().expect("a subject"),
-                incumbent.claim_id.clone().expect("a claim"),
+                current_attachment(&registry, incumbent.subject_id.as_ref().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .claim_id,
             )),
             metadata.clone(),
             2,
@@ -4117,7 +4088,10 @@ mod tests {
             None,
             Some((
                 first.subject_id.clone().expect("a subject"),
-                first.claim_id.clone().expect("a claim"),
+                current_attachment(&registry, first.subject_id.as_ref().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .claim_id,
             )),
             persisted.managed.clone(),
             2,
@@ -4141,6 +4115,49 @@ mod tests {
             create_with_intent(&registry, &random_uuid(), launch(), None, None, invalid, 3,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_registration_presenting_another_session_settles_its_own_mismatched_reservation() {
+        use crate::control_plane::registry::presence::{Standing, begin, decision};
+        let scratch = Scratch::new("own-reservation-mismatch");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("incumbent");
+        let subject = first.subject_id.clone().expect("subject");
+        let incumbent = first.claim_id.clone().expect("claim");
+        release_claim(&registry, &incumbent).expect("release");
+        let incumbent = current_attachment(&registry, &subject)
+            .unwrap()
+            .unwrap()
+            .claim_id;
+        let intended = random_uuid();
+        let ticket = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            Some(intended.clone()),
+            Some((subject.clone(), incumbent)),
+            ManagedMetadata::default(),
+            2,
+        )
+        .expect("reservation");
+        let reserved = ticket.claim_id.clone().expect("claim");
+        let presented = begin(&registry, &ticket.registration_id, None, &random_uuid(), 3)
+            .expect("actual session");
+        assert_ne!(
+            presented.claim_id, reserved,
+            "the mismatched reservation is not fulfilled"
+        );
+        assert_eq!(
+            decision(&registry, &reserved).unwrap().unwrap().standing,
+            Standing::Released
+        );
+        assert_eq!(
+            decision(&registry, &reserved).unwrap().unwrap().session_id,
+            Some(intended),
+            "the intended session is retained as the failed intent"
+        );
+        assert_eq!(reserved_claim(&registry, &subject).unwrap(), None);
     }
 
     #[test]
@@ -4528,6 +4545,10 @@ mod tests {
         let logical_id = first.subject_id.clone().expect("a subject");
         let incumbent = first.claim_id.clone().expect("a claim");
         release_claim(&registry, &incumbent).expect("release the first reservation");
+        let incumbent = current_attachment(&registry, &logical_id)
+            .unwrap()
+            .unwrap()
+            .claim_id;
         let second = create_with_intent(
             &registry,
             &random_uuid(),
@@ -5101,12 +5122,16 @@ mod tests {
 
         release_claim(&registry, first.claim_id.as_ref().expect("claim"))
             .expect("release the first reservation");
+        let predecessor = current_attachment(&registry, &logical_id)
+            .unwrap()
+            .unwrap()
+            .claim_id;
         let second = create_with_intent(
             &registry,
             &random_uuid(),
             launch(),
             None,
-            Some((logical_id.clone(), first.claim_id.clone().expect("a claim"))),
+            Some((logical_id.clone(), predecessor)),
             ManagedMetadata::default(),
             2,
         )
@@ -5207,12 +5232,16 @@ mod tests {
         let subject_id = first.subject_id.clone().expect("a subject");
         release_claim(&registry, first.claim_id.as_ref().expect("claim"))
             .expect("release the first reservation");
+        let predecessor = current_attachment(&registry, &subject_id)
+            .unwrap()
+            .unwrap()
+            .claim_id;
         let reserved = create_with_intent(
             &registry,
             &random_uuid(),
             launch(),
             None,
-            Some((subject_id.clone(), first.claim_id.clone().expect("a claim"))),
+            Some((subject_id.clone(), predecessor)),
             ManagedMetadata::default(),
             2,
         )

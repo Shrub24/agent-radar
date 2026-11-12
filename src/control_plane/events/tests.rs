@@ -35,6 +35,122 @@ fn create(registry: &Registry) -> lifecycle::Ticket {
 }
 
 #[test]
+fn authority_and_granted_history_survive_reservation_and_replay() {
+    let fixture = Fixture::new();
+    let registry = fixture.registry();
+    let first = create(&registry);
+    let incumbent = first.claim_id.unwrap();
+    let subject = first.subject_id.unwrap();
+    registry
+        .events
+        .lock()
+        .unwrap()
+        .append(
+            Stream::Claim(&incumbent),
+            "2026-01-01T00:00:00Z",
+            Source::Registration,
+            Transition::Granted {
+                subject_id: subject.clone(),
+            },
+        )
+        .unwrap();
+    let successor = lifecycle::create_with_intent(
+        &registry,
+        &random_uuid(),
+        launch(),
+        None,
+        Some((subject.clone(), incumbent.clone())),
+        lifecycle::ManagedMetadata::default(),
+        2000,
+    )
+    .unwrap()
+    .claim_id
+    .unwrap();
+    {
+        let mut log = registry.events.lock().unwrap();
+        assert!(
+            log.append(
+                Stream::Claim(&successor),
+                "2026-01-01T00:00:01Z",
+                Source::Registration,
+                Transition::Granted {
+                    subject_id: subject.clone()
+                },
+            )
+            .unwrap_err()
+            .contains("granted attachment")
+        );
+        log.append(
+            Stream::Claim(&successor),
+            "2026-01-01T00:00:02Z",
+            Source::Registration,
+            Transition::Presence {
+                session: random_uuid(),
+            },
+        )
+        .unwrap();
+        assert_eq!(log.reserved_claim(&subject), Some(successor.clone()));
+        assert_eq!(log.attachment(&subject), Some(incumbent.clone()));
+    }
+    lifecycle::release_claim(&registry, &successor).unwrap();
+    lifecycle::release_claim(&registry, &incumbent).unwrap();
+    drop(registry);
+    let registry = fixture.registry();
+    let log = registry.events.lock().unwrap();
+    assert_eq!(log.granted_claim(&subject), None);
+    assert_eq!(log.reserved_claim(&subject), None);
+    assert_eq!(
+        log.attachment(&subject),
+        Some(incumbent),
+        "a cancelled reservation is not granted history"
+    );
+}
+
+#[test]
+fn replay_refuses_two_grants_on_one_subject() {
+    let fixture = Fixture::new();
+    let registry = fixture.registry();
+    let first = create(&registry);
+    let incumbent = first.claim_id.unwrap();
+    let subject = first.subject_id.unwrap();
+    let other = lifecycle::create_with_intent(
+        &registry,
+        &random_uuid(),
+        launch(),
+        None,
+        None,
+        lifecycle::ManagedMetadata::default(),
+        2000,
+    )
+    .unwrap();
+    {
+        let mut log = registry.events.lock().unwrap();
+        log.append(
+            Stream::Claim(&incumbent),
+            "2026-01-01T00:00:00Z",
+            Source::Registration,
+            Transition::Granted {
+                subject_id: subject,
+            },
+        )
+        .unwrap();
+        let mut conflicting = log.facts(&incumbent).unwrap();
+        conflicting.registration_id = other.registration_id;
+        let claim = ClaimId::random();
+        let event = log.event(
+            Stream::Claim(&claim),
+            "2026-01-01T00:00:01Z",
+            Source::Registration,
+            Transition::Enrolled(Box::new(conflicting)),
+        );
+        log.persist(&event).unwrap();
+    }
+    drop(registry);
+    let error = Log::open(&fixture.directory()).unwrap_err();
+    assert!(error.contains("granted attachment"), "{error}");
+}
+
+#[test]
 fn a_process_can_be_recovered_without_fabricating_a_claim() {
     let fixture = Fixture::new();
     let registry = fixture.registry();
@@ -244,14 +360,6 @@ fn attachment_views_share_process_evidence_across_replay() {
         let before_signal = log
             .facts(ticket.claim_id.as_ref().expect("a claim"))
             .unwrap();
-        let next_claim = ClaimId::random();
-        log.append(
-            Stream::Claim(&next_claim),
-            "2026-01-01T00:00:01.000Z",
-            Source::Registration,
-            Transition::Enrolled(Box::new(before_signal.clone())),
-        )
-        .unwrap();
         // Process evidence belongs to the execution's own stream.
         log.append(
             Stream::Process(&ticket.registration_id),
@@ -266,18 +374,10 @@ fn attachment_views_share_process_evidence_across_replay() {
                 .signalled_at
                 .is_some()
         );
-        let stale = ClaimId::random();
-        log.append(
-            Stream::Claim(&stale),
-            "2026-01-01T00:00:03.000Z",
-            Source::Registration,
-            Transition::Enrolled(Box::new(before_signal)),
-        )
-        .unwrap();
         assert_eq!(
-            log.facts(&stale).expect("the attachment"),
-            log.facts(&next_claim).expect("the attachment"),
-            "an attachment carries no execution facts of its own"
+            log.facts(ticket.claim_id.as_ref().unwrap()).unwrap(),
+            before_signal,
+            "signalling the execution does not rewrite its attachment"
         );
     }
     drop(registry);

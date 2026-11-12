@@ -248,9 +248,20 @@ pub fn begin(
         return Ok(existing);
     }
     if let Some(reserved) = lifecycle::reservation_for(registry, registration_id)? {
-        lifecycle::claim_presence(registry, &reserved, session_id, now_ms)?;
-        return decision(registry, &reserved)?
-            .ok_or_else(|| "the reserved claim was not readable".into());
+        let intended = decision(registry, &reserved)?
+            .ok_or("the reserved claim was not readable")?
+            .session_id;
+        if intended
+            .as_deref()
+            .is_none_or(|recorded| recorded == session_id)
+        {
+            lifecycle::claim_presence(registry, &reserved, session_id, now_ms)?;
+            return decision(registry, &reserved)?
+                .ok_or_else(|| "the reserved claim was not readable".into());
+        }
+        // This registration came back as another session, so the intended
+        // continuation cannot happen. Settle it before the actual session is judged.
+        lifecycle::release_claim(registry, &reserved)?;
     }
     if let Some(existing) = current(registry, registration_id)?
         && !existing.standing.is_terminal()
@@ -258,17 +269,17 @@ pub fn begin(
         if existing
             .session_id
             .as_deref()
-            .is_some_and(|recorded| recorded != session_id)
+            .is_none_or(|recorded| recorded == session_id)
         {
-            return Err(
-                "the registration already holds a claim for another session; release it first"
-                    .into(),
-            );
+            if !existing.standing.grants_authority() {
+                lifecycle::claim_presence(registry, &existing.claim_id, session_id, now_ms)?;
+            }
+            return decision(registry, &existing.claim_id)?
+                .ok_or_else(|| "claim disappeared".into());
         }
-        if !existing.standing.grants_authority() {
-            lifecycle::claim_presence(registry, &existing.claim_id, session_id, now_ms)?;
-        }
-        return decision(registry, &existing.claim_id)?.ok_or_else(|| "claim disappeared".into());
+        // A new session on this registration replaces the previous attachment,
+        // whose shutdown release was not delivered.
+        lifecycle::release_claim(registry, &existing.claim_id)?;
     }
     let execution = lifecycle::adopted_execution(registry, registration_id, now_ms)?;
     let claim_id = ClaimId::random();

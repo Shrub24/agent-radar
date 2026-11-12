@@ -89,6 +89,10 @@ impl Standing {
         matches!(self, Self::Granted)
     }
 
+    pub fn reserves_attachment(self) -> bool {
+        matches!(self, Self::Reserved | Self::Pending)
+    }
+
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Duplicate | Self::Released)
     }
@@ -344,6 +348,13 @@ impl Stream<'_> {
 /// One daemon-scoped FIFO, protected by the owning registry. Immutable files
 /// reuse the registry's fsync/rename discipline; public pointer retention cannot
 /// discard this authority.
+#[derive(Debug, Default)]
+struct SubjectAttachments {
+    granted: Option<ClaimId>,
+    reserved: Option<ClaimId>,
+    last_granted: Option<ClaimId>,
+}
+
 #[derive(Debug)]
 pub struct Log {
     directory: PathBuf,
@@ -352,6 +363,8 @@ pub struct Log {
     /// The sequence that last changed each claim, so "current", "reserved" and
     /// "previous grant" are read in recorded order rather than guessed from ids.
     claim_seq: BTreeMap<ClaimId, u64>,
+    subjects: BTreeMap<SubjectId, SubjectAttachments>,
+    registrations: BTreeMap<RegistrationId, ClaimId>,
     processes: BTreeMap<RegistrationId, ProcessFacts>,
     operations: BTreeMap<String, RequestRecord>,
     containers: BTreeMap<String, Container>,
@@ -393,6 +406,8 @@ impl Log {
             next_seq: 1,
             facts: BTreeMap::new(),
             claim_seq: BTreeMap::new(),
+            subjects: BTreeMap::new(),
+            registrations: BTreeMap::new(),
             processes: BTreeMap::new(),
             operations: BTreeMap::new(),
             containers: BTreeMap::new(),
@@ -541,11 +556,87 @@ impl Log {
 
     /// The newest claim for one registration, whatever its standing.
     pub fn claim_of_registration(&self, registration_id: &RegistrationId) -> Option<ClaimId> {
-        self.facts
-            .iter()
-            .filter(|(_, facts)| &facts.registration_id == registration_id)
-            .max_by_key(|(claim, _)| self.claim_seq.get(*claim).copied().unwrap_or(0))
-            .map(|(claim, _)| claim.clone())
+        self.registrations.get(registration_id).cloned()
+    }
+
+    pub fn granted_claim(&self, subject: &SubjectId) -> Option<ClaimId> {
+        self.subjects.get(subject)?.granted.clone()
+    }
+
+    pub fn reserved_claim(&self, subject: &SubjectId) -> Option<ClaimId> {
+        self.subjects.get(subject)?.reserved.clone()
+    }
+
+    pub fn attachment(&self, subject: &SubjectId) -> Option<ClaimId> {
+        let claims = self.subjects.get(subject)?;
+        claims
+            .granted
+            .clone()
+            .or_else(|| claims.reserved.clone())
+            .or_else(|| claims.last_granted.clone())
+    }
+
+    fn validate_attachment(&self, id: &ClaimId, next: &AttachmentFacts) -> Result<(), String> {
+        if let Some(previous) = self.facts.get(id)
+            && (previous.registration_id != next.registration_id
+                || previous
+                    .subject_id
+                    .as_ref()
+                    .is_some_and(|subject| next.subject_id.as_ref() != Some(subject)))
+        {
+            return Err("a claim cannot change its registration or subject".into());
+        }
+        if !next.standing.is_terminal() {
+            if let Some(other) = self.registrations.get(&next.registration_id)
+                && other != id
+                && !self.facts[other].standing.is_terminal()
+            {
+                return Err("the registration already holds an attachment".into());
+            }
+            if let Some(claims) = next
+                .subject_id
+                .as_ref()
+                .and_then(|subject| self.subjects.get(subject))
+            {
+                if claims.reserved.as_ref().is_some_and(|other| other != id)
+                    && claims.granted.as_ref() != Some(id)
+                {
+                    return Err("the subject already has a reserved attachment".into());
+                }
+                if next.standing.grants_authority()
+                    && claims.granted.as_ref().is_some_and(|other| other != id)
+                {
+                    return Err("the subject already has a granted attachment".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn index_attachment(&mut self, id: &ClaimId, next: &AttachmentFacts) {
+        if let Some(subject) = &next.subject_id {
+            let claims = self.subjects.entry(subject.clone()).or_default();
+            if claims.granted.as_ref() == Some(id) {
+                claims.granted = None;
+            }
+            if claims.reserved.as_ref() == Some(id) {
+                claims.reserved = None;
+            }
+            if next.standing.grants_authority() {
+                claims.granted = Some(id.clone());
+                claims.last_granted = Some(id.clone());
+            } else if next.standing.reserves_attachment() {
+                claims.reserved = Some(id.clone());
+            }
+        }
+        let current = self.registrations.get(&next.registration_id);
+        if !next.standing.is_terminal()
+            || current
+                .is_none_or(|current| current == id || self.facts[current].standing.is_terminal())
+        {
+            self.registrations
+                .insert(next.registration_id.clone(), id.clone());
+        }
     }
 
     /// Materialized attachment views over the one process owner per registration.
@@ -666,9 +757,9 @@ impl Log {
             Stream::Claim(id) => {
                 let attachment = self.facts.get(id);
                 let execution = attachment.and_then(|a| self.processes.get(&a.registration_id));
-                Ok(Recorded::Attachment(Box::new(reduce_attachment(
-                    attachment, execution, event,
-                )?)))
+                let next = reduce_attachment(attachment, execution, event)?;
+                self.validate_attachment(id, &next)?;
+                Ok(Recorded::Attachment(Box::new(next)))
             }
             Stream::Process(id) => Ok(Recorded::Execution(Box::new(reduce_process(
                 self.processes.get(id),
@@ -756,6 +847,7 @@ impl Log {
             _ => match self.reduce_event(stream, event)? {
                 Recorded::Attachment(attachment) => {
                     if let Stream::Claim(claim) = stream {
+                        self.index_attachment(claim, &attachment);
                         self.facts.insert(claim.clone(), *attachment);
                         self.claim_seq.insert(claim.clone(), event.seq);
                     }

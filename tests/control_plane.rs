@@ -12621,7 +12621,7 @@ fn a_claimless_report_recovers_the_attachment_it_already_made() {
 }
 
 #[test]
-fn a_claimless_report_for_another_session_is_refused_rather_than_replacing_the_claim() {
+fn a_claimless_report_for_another_session_replaces_the_registrations_previous_attachment() {
     let sandbox = Sandbox::new("presence-other-session");
     let lead = LeadProcess::start();
     let backend = MuxBackend::new(LEAD_PRIMITIVES)
@@ -12639,19 +12639,30 @@ fn a_claimless_report_for_another_session_is_refused_rather_than_replacing_the_c
         "location":{"backend":"tmux","pane":"wA:p1"}});
     let held = client.call("agent.presence", report.clone());
     assert_eq!(held["result"]["standing"], "granted", "{held}");
-    // Session shutdown precedes the next start, so a report for a different
-    // session without a release is a caller fault, not a switch to make for it.
+    // A new session on the same process means the previous session's shutdown
+    // release never arrived; Radar settles it rather than strand the next session.
     let mut other = report;
     other["session_id"] = json!(random_uuid());
-    let refused = client.call("agent.presence", other);
-    assert_eq!(error_code(&refused), "refused", "{refused}");
-    let current = client.call(
-        "lifecycle.get",
-        json!({"subject_id": held["result"]["subject_id"]}),
+    let replacement = client.call("agent.presence", other);
+    assert_eq!(
+        replacement["result"]["standing"], "granted",
+        "{replacement}"
+    );
+    assert_ne!(
+        replacement["result"]["claim_id"], held["result"]["claim_id"],
+        "the replacement is a new attachment"
+    );
+    let old = client.call(
+        "agent.presence",
+        json!({"source":"herdsman-pi","incarnation":PARENT_INCARNATION,
+            "process":lead.identity,"session_id":TRACKED_SESSION,
+            "claim_id":held["result"]["claim_id"],
+            "location":{"backend":"tmux","pane":"wA:p1"}}),
     );
     assert_eq!(
-        current["result"]["subject"]["claim_id"], held["result"]["claim_id"],
-        "the incumbent lost its claim to a report that was refused"
+        error_code(&old),
+        "refused",
+        "a released claim stays released: {old}"
     );
     daemon.stop();
     lead.kill();
