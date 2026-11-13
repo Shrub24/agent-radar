@@ -389,6 +389,8 @@ A claim's recorded facts are its registration, subject, managed metadata, sessio
 
 ## A reservation that cannot be fulfilled fails its intent, visibly
 
+**Id:** fb405b9f-20cb-4582-bfc6-798f695a6add
+**Type:** decision
 **Status:** active
 **Evidence:** confirmed
 **Source:** maintainer ruling "record the intended restart as failed, allow ordinary attachment to the actual session, error on tui, no automatic retry for now", 2026-11-09
@@ -406,6 +408,8 @@ A registration whose own reservation named one session but which presented anoth
 
 ## Claim authority is a maintained cache over the claim log
 
+**Id:** 7f136849-881a-4be4-87f3-4d89f207c845
+**Type:** decision
 **Status:** active
 **Evidence:** confirmed
 **Source:** maintainer ruling "the index is just the cache; the claim is the source of truth", 2026-11-09
@@ -419,6 +423,8 @@ A subject's grant, its exclusive reservation, its most recently granted claim an
 
 ## The pane names its live occupant; rows do not join
 
+**Id:** d9223940-8b69-4bc3-8aa1-2264ca7963c9
+**Type:** decision
 **Status:** active
 **Evidence:** confirmed
 **Source:** maintainer ruling "I would make the Pane own the process ref itself", 2026-11-10; earlier agreement that topology panes carry the registration link
