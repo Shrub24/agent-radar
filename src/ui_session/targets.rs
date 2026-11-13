@@ -106,6 +106,7 @@ pub(crate) fn focused_row(
         nav.node(id).is_some_and(|node| match &node.row.kind {
             RowKind::Agent(agent) => !agent.history() && agent.retained.is_none(),
             RowKind::Pane(_) => true,
+            RowKind::Lifecycle(row) => row.pane_id.is_some(),
             _ => false,
         })
     })
@@ -161,9 +162,9 @@ pub(crate) fn selection(kind: &RowKind, represents_tab: Option<&str>) -> Selecte
         RowKind::Task(_) => Selected::Refused("a background task is not a close target"),
         // A launch that has not presented has no agent row, but its pane is the
         // place the operator sees; closing it is the ordinary fenced pane close.
-        RowKind::Lifecycle(lifecycle) => match lifecycle.execution.occupied_pane() {
+        RowKind::Lifecycle(lifecycle) => match &lifecycle.pane_id {
             Some(pane_id) => Selected::Pane {
-                pane_id: pane_id.to_string(),
+                pane_id: pane_id.clone(),
                 tab: None,
                 losses: vec![format!(
                     "execution {} ({})",
@@ -171,7 +172,7 @@ pub(crate) fn selection(kind: &RowKind, represents_tab: Option<&str>) -> Selecte
                     lifecycle.title
                 )],
             },
-            None => Selected::Refused("this execution holds no pane to close"),
+            None => Selected::Refused("this execution occupies no pane to close"),
         },
     }
 }
@@ -874,27 +875,26 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_that_has_not_presented_closes_through_its_pane() {
+    fn a_launch_closes_only_through_the_pane_it_occupies() {
         let execution: crate::model::ExecutionObservation = serde_json::from_value(serde_json::json!({
             "registration_id": "00000000-0000-4000-8000-0000000000d1",
             "state": "pending", "origin": "spawned", "ended": false,
             "placement": {"location": {"backend": "tmux", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"}}
         })).unwrap();
-        let row = |execution| {
+        let row = |pane_id: Option<&str>| {
             RowKind::Lifecycle(Box::new(crate::tree::LifecycleRow {
-                execution,
+                execution: execution.clone(),
                 title: "pending".into(),
+                pane_id: pane_id.map(str::to_string),
             }))
         };
-        match selection(&row(execution.clone()), None) {
+        match selection(&row(Some("wA:p1")), None) {
             Selected::Pane { pane_id, .. } => assert_eq!(pane_id, "wA:p1"),
             other => panic!("{other:?}"),
         }
-        let mut ended = execution;
-        ended.ended = true;
         assert!(
-            matches!(selection(&row(ended), None), Selected::Refused(_)),
-            "an ended execution holds no pane"
+            matches!(selection(&row(None), None), Selected::Refused(_)),
+            "a recorded placement the pane does not name as its occupant closes nothing"
         );
     }
 

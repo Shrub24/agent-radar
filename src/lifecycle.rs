@@ -146,6 +146,9 @@ pub struct AgentIdentity {
 pub struct PaneIdentity {
     pub pane_id: String,
     pub occupant: Option<AgentIdentity>,
+    /// The registration the observation named as this pane's occupant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<crate::identity::RegistrationId>,
 }
 
 /// The observed identity of a close target, frozen at confirmation.
@@ -168,6 +171,16 @@ pub enum TargetIdentity {
 }
 
 impl TargetIdentity {
+    /// Every pane this identity froze.
+    pub fn panes_mut(&mut self) -> Vec<&mut PaneIdentity> {
+        match self {
+            Self::Pane(pane) => vec![pane],
+            Self::Tab { members, .. } | Self::Workspace { members, .. } => {
+                members.iter_mut().collect()
+            }
+        }
+    }
+
     /// The target this identity describes.
     pub fn target(&self) -> CloseTarget {
         match self {
@@ -221,6 +234,9 @@ pub fn matches(inventory: &FleetObservation, expected: &TargetIdentity) -> bool 
 fn pane_identity(inventory: &FleetObservation, pane_id: &str) -> PaneIdentity {
     PaneIdentity {
         pane_id: pane_id.to_string(),
+        registration_id: inventory
+            .pane(pane_id)
+            .and_then(|pane| pane.registration_id.clone()),
         occupant: inventory
             .agents
             .iter()
@@ -291,6 +307,16 @@ mod tests {
             panes: panes.iter().map(|id| pane_row(id)).collect(),
             agents,
         }
+    }
+
+    #[test]
+    fn a_frozen_pane_notices_another_registration_occupying_it() {
+        let mut fleet = inventory(&["wA:p1"], Vec::new());
+        fleet.panes[0].registration_id = Some(crate::identity::RegistrationId::random());
+        let frozen = identity(&fleet, &CloseTarget::Pane("wA:p1".into()));
+        assert!(matches(&fleet, &frozen));
+        fleet.panes[0].registration_id = Some(crate::identity::RegistrationId::random());
+        assert!(!matches(&fleet, &frozen), "a replaced occupant is drift");
     }
 
     fn retained(agent: AgentObservation) -> BTreeMap<String, RetainedAgent> {

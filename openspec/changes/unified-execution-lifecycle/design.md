@@ -124,14 +124,18 @@ Revoked executions that never presented are hidden from the default view for now
 A derived row record composes the registration, optional claim, optional subject
 and placement. It is a view, not a durable row store or another owner of placement.
 The observation's pane names the live registration occupying it. The collector
-resolves that once from each execution's recorded placement
-(`FleetObservation::resolve_occupants`) and rows read it; no consumer re-derives
-occupancy. Placement stays recorded once, on the execution: the pane's reference is
-computed at publication, never stored. An ended or withdrawn execution occupies
-nothing, so the shell it leaves is an ordinary pane. When two live executions name
-one pane (a restart's successor beside its predecessor) the one holding an
-attachment occupies it, then the greater registration id, so the answer is
-deterministic. Executions with no pane stay rows of their own.
+resolves that once (`FleetObservation::resolve_occupants`) and rows read it; no
+consumer re-derives occupancy. A registration whose agent is joined to the pane is
+the occupant, because that join is verified against the pane's foreground process.
+Otherwise a live execution whose recorded placement names this backend and pane is,
+when exactly one stands out: a grant over a reservation, and two of equal standing
+name no occupant. Placement stays recorded once, on the execution: the pane's
+reference is computed at publication, never stored. An ended or withdrawn execution
+occupies nothing, so the shell it leaves is an ordinary pane. The occupied pane is
+the row and keeps its identity while its occupant presents or a restart replaces it;
+executions that occupy no pane are rows of their own keyed by registration. A close
+from an execution row is offered only through the pane that names it, and the
+confirmation freezes that occupant so the daemon refuses once it has ended or moved.
 
 Rationale: a client-side join by placement could not know the serving backend
 generation, duplicated rows and picked an execution by key order. The collector

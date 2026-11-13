@@ -678,34 +678,61 @@ impl ExecutionObservation {
 }
 
 impl FleetObservation {
-    /// Names, on each pane, the live registration the daemon placed there. When
-    /// more than one live execution claims a pane, the one holding an attachment
-    /// wins, so a restart's successor and its predecessor never tie by id order.
-    pub fn resolve_occupants(&mut self) {
-        let mut occupants: std::collections::HashMap<&str, &ExecutionObservation> =
-            std::collections::HashMap::new();
+    /// Names, on each pane, the live registration occupying it. A registration
+    /// whose agent is joined to the pane is the occupant: that join is verified
+    /// against the pane's foreground process. Otherwise a live execution whose
+    /// placement names this backend and pane is, provided exactly one stands out:
+    /// one holding a grant over one holding a reservation, and two of equal
+    /// standing are ambiguous, so the pane names neither.
+    pub fn resolve_occupants(&mut self, backend: &crate::runtime::BackendIdentity) {
+        use std::collections::HashMap;
+        let mut occupants: HashMap<String, Option<crate::identity::RegistrationId>> =
+            HashMap::new();
+        let mut ranks: HashMap<String, (bool, bool)> = HashMap::new();
         for execution in &self.executions {
+            let Some(placement) = execution.placement.as_ref() else {
+                continue;
+            };
             let Some(pane) = execution.occupied_pane() else {
                 continue;
             };
-            let rank =
-                |e: &ExecutionObservation| (e.claim_id.is_some(), e.reserved_claim_id.is_some());
-            match occupants.get(pane) {
-                Some(held)
-                    if (rank(held), &held.registration_id)
-                        >= (rank(execution), &execution.registration_id) => {}
+            if placement.location.backend != backend.name
+                || placement.location.instance != backend.instance
+            {
+                continue;
+            }
+            let rank = (
+                execution.claim_id.is_some(),
+                execution.reserved_claim_id.is_some(),
+            );
+            match ranks.get(pane) {
+                Some(held) if *held > rank => {}
+                Some(held) if *held == rank => {
+                    occupants.insert(pane.to_owned(), None);
+                }
                 _ => {
-                    occupants.insert(pane, execution);
+                    ranks.insert(pane.to_owned(), rank);
+                    occupants.insert(pane.to_owned(), Some(execution.registration_id.clone()));
                 }
             }
         }
-        let resolved: std::collections::HashMap<String, crate::identity::RegistrationId> =
-            occupants
-                .into_iter()
-                .map(|(pane, execution)| (pane.to_owned(), execution.registration_id.clone()))
-                .collect();
+        for agent in &self.agents {
+            if agent.registry.binding == crate::registry_observation::Binding::Joined {
+                occupants
+                    .entry(agent.location.pane_id.clone())
+                    .and_modify(|occupant| {
+                        *occupant = Some(agent.registry.agent.registration.registration_id.clone())
+                    })
+                    .or_insert_with(|| {
+                        Some(agent.registry.agent.registration.registration_id.clone())
+                    });
+            }
+        }
         for pane in &mut self.panes {
-            pane.registration_id = resolved.get(pane.location.pane_id.as_str()).cloned();
+            pane.registration_id = occupants
+                .get(pane.location.pane_id.as_str())
+                .cloned()
+                .flatten();
         }
     }
 }
@@ -1206,7 +1233,7 @@ mod tests {
             "registration_id": format!("00000000-0000-4000-8000-0000000000{registration:02x}"),
             "state": "bound", "origin": "spawned", "ended": ended,
             "claim_id": claim.then(|| format!("00000000-0000-4000-8000-0000000001{registration:02x}")),
-            "placement": {"location": {"backend": "tmux", "workspace": "w", "tab": "t", "pane": pane}}
+            "placement": {"location": {"backend": "tmux", "instance": "radar", "workspace": "w", "tab": "t", "pane": pane}}
         })).unwrap()
     }
 
@@ -1229,23 +1256,39 @@ mod tests {
                 execution(1, "p1", false, false), // restart successor, not yet granted
                 execution(2, "p1", true, false),  // the incumbent holds the attachment
                 execution(3, "p2", true, true),   // ended: the shell it left is just a pane
+                execution(4, "p3", true, false),  // two equal claims on one pane name neither
+                execution(5, "p3", true, false),
             ],
             ..Default::default()
         };
-        fleet.resolve_occupants();
-        let occupant = |i: usize| {
+        fleet.resolve_occupants(&crate::runtime::BackendIdentity::tmux("radar"));
+        let occupant = |fleet: &super::FleetObservation, i: usize| {
             fleet.panes[i]
                 .registration_id
                 .as_ref()
                 .map(|r| r.as_str()[r.as_str().len() - 2..].to_string())
         };
         assert_eq!(
-            occupant(0).as_deref(),
+            occupant(&fleet, 0).as_deref(),
             Some("02"),
             "the attached execution holds a contested pane"
         );
-        assert_eq!(occupant(1), None, "an ended execution occupies nothing");
-        assert_eq!(occupant(2), None);
+        assert_eq!(
+            occupant(&fleet, 1),
+            None,
+            "an ended execution occupies nothing"
+        );
+        assert_eq!(
+            occupant(&fleet, 2),
+            None,
+            "an ambiguous pane names no occupant"
+        );
+        fleet.resolve_occupants(&crate::runtime::BackendIdentity::tmux("another"));
+        assert_eq!(
+            occupant(&fleet, 0),
+            None,
+            "a placement on another server occupies nothing here"
+        );
     }
 
     fn facts(model: &str, provider: &str) -> HerdsmanFacts {

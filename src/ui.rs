@@ -1295,6 +1295,7 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, ink: RowInk, marks: Marks) -> Lis
                 ))
                 .then(|| sanitize(agent.state.word())),
                 (!agent.joined()).then(|| "unresolved".to_string()),
+                agent.intent_failed.then(|| "intent failed".to_string()),
                 agent.facts.assigned_for.map(duration),
                 agent.facts.model_and_thinking().map(|m| sanitize(&m)),
                 (unresolved > 0).then(|| {

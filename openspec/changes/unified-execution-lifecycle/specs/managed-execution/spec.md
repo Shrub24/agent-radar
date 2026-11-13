@@ -28,8 +28,8 @@ Adoption, configured launches, recipe launches, restart and spawn SHALL use the 
 - **WHEN** an already running process is admitted without a subject
 - **THEN** its execution records verified identity and can later acquire a subject through presence
 
-### Requirement: Default execution rows join by registration
-The default view SHALL show each included registration once, enriched by optional claim, subject, public facts and verified placement, without a duplicate plain-pane row. It SHALL retain unregistered topology panes and unplaced execution rows, but SHALL NOT create execution rows from subjects alone. Existing lifecycle and history filters SHALL apply.
+### Requirement: Default rows are panes and the executions no pane holds
+The default view SHALL show each pane once. A pane naming a live occupying registration SHALL be that registration's row and keep its identity while its occupant presents or is replaced. An execution occupying no pane SHALL be a row of its own. No registration SHALL appear twice, and subjects alone SHALL NOT create rows. Unregistered panes remain, and lifecycle and history filters apply.
 
 #### Scenario: A revoked launch never presented
 - **WHEN** a revoked execution never reported presence
@@ -37,11 +37,11 @@ The default view SHALL show each included registration once, enriched by optiona
 
 #### Scenario: A launch gains an attachment
 - **WHEN** a placed launch transitions from reservation through identification to granted presence
-- **THEN** one execution row retains its registration identity and gains attachment and subject data without a separate pending subject row
+- **THEN** its pane's row keeps one identity and gains attachment and subject data without a separate pending subject row
 
 #### Scenario: A reserved successor shares a subject
 - **WHEN** a predecessor and its reserved successor are both included by the view's filters
-- **THEN** they appear as distinct registration rows enriched with the same subject and their distinct attachment standings
+- **THEN** the predecessor holding the grant is its pane's row and the successor is a row of its own with its reserved standing, until it occupies the pane
 
 #### Scenario: An unregistered pane remains topology
 - **WHEN** a pane is not associated with any represented registration
@@ -49,14 +49,14 @@ The default view SHALL show each included registration once, enriched by optiona
 
 #### Scenario: An execution has no verified pane
 - **WHEN** an included execution has no verified placement
-- **THEN** its registration row remains visible as unplaced rather than becoming a standalone subject row
+- **THEN** it remains visible as a row of its own rather than becoming a standalone subject row
 
 #### Scenario: A subject remains after execution history is filtered
 - **WHEN** a retained subject has no registration included by the default view
 - **THEN** it does not create a default execution row
 
 #### Scenario: The pane names its occupant
-- **WHEN** a live execution's recorded placement names a pane
+- **WHEN** a registration's agent is joined to a pane, or else one live execution's recorded placement names this backend and pane
 - **THEN** the published pane names that registration as its occupant, resolved once by the collector, and rows read it rather than re-deriving occupancy
 
 #### Scenario: An ended execution leaves an ordinary pane
@@ -64,16 +64,20 @@ The default view SHALL show each included registration once, enriched by optiona
 - **THEN** the pane names no occupant and remains an ordinary pane row
 
 #### Scenario: A successor and its predecessor name one pane
-- **WHEN** two live executions are placed in one pane
-- **THEN** the pane's occupant is the one holding an attachment, deterministically, not the one that sorts first by key
+- **WHEN** two live executions are placed in one pane and no agent is joined to it
+- **THEN** the pane's occupant is the one holding a grant over one holding a reservation, and two of equal standing name no occupant rather than one chosen by key order
 
 #### Scenario: A launch that has not presented is closed through its pane
-- **WHEN** the operator closes the row of a placed execution that has no agent registration yet
-- **THEN** the ordinary fenced pane close is requested for its pane
+- **WHEN** the operator closes the row of an execution its pane names as occupant and that has no agent registration yet
+- **THEN** the ordinary fenced pane close is requested for that pane, carrying the occupant the operator confirmed, and the daemon refuses if that registration ended or is no longer placed there
+
+#### Scenario: An execution that occupies no pane closes nothing
+- **WHEN** the operator closes the row of an execution whose recorded placement its pane does not name as occupant
+- **THEN** no pane close is offered
 
 #### Scenario: A failed intended attachment is published
 - **WHEN** a registration's own reservation was settled because another session presented
-- **THEN** its execution observation carries the failure reason, and the TUI names it on the row and in details
+- **THEN** its execution observation carries the failure reason, and the TUI names it on the execution's row, including the agent row it attaches as, and in details
 
 ### Requirement: Execution row composition does not create another state owner
 The execution row record SHALL be a derived join of registration, optional claim, optional subject and placement. It SHALL NOT be a persisted row store or independently maintained placement authority. A topology link SHALL NOT bypass backend-generation verification.

@@ -422,11 +422,11 @@ A subject's grant, its exclusive reservation, its most recently granted claim an
 **Status:** active
 **Evidence:** confirmed
 **Source:** maintainer ruling "I would make the Pane own the process ref itself", 2026-11-10; earlier agreement that topology panes carry the registration link
-**Verification:** corroborated — `a_pane_names_the_one_live_execution_that_holds_it`, and the tree test `a_registration_with_an_agent_and_an_execution_is_one_row` fails when the agent-represented dedupe is removed
+**Verification:** corroborated — `a_pane_names_the_one_live_execution_that_holds_it`, `the_joined_agent_occupies_its_pane_and_carries_a_failed_intent` and `the_pane_keeps_its_row_when_its_launch_presents` each fail when the guard they cover is removed
 
-`Pane.registration_id` is resolved once in the collector from each execution's recorded placement. An ended or withdrawn execution occupies nothing; of two live executions on one pane the attached one wins. Placement stays recorded once on the execution.
+`Pane.registration_id` is resolved once in the collector. A joined agent is its pane's occupant, because that join is verified against the pane's foreground process; otherwise a live execution whose placement names this backend and pane is, provided one stands out — a grant over a reservation, and equal standing names none. An ended or withdrawn execution occupies nothing. Placement stays recorded once on the execution. The occupied pane is the row, so its identity survives presence and restart; an execution that occupies no pane is its own row and offers no pane close.
 
-**Reason:** the earlier client-side join by placement duplicated rows, chose an execution by key order and could not know the serving generation.
+**Reason:** the earlier client-side join by placement duplicated rows, chose an execution by key order and could not know the serving generation. Breaking an equal-standing tie by registration id would have been the same arbitrary choice.
 
 **Rejected alternative:** key every row by registration. Rejected: a restart reuses the pane and creates a new registration, so a registration-keyed row changes identity at each restart.
 

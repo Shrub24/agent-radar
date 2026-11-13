@@ -100,14 +100,43 @@ pub(super) fn execute_close(
 }
 
 /// The identity this daemon can compare against its own backend inventory. That
-/// inventory carries no registry joins, so a named execution's occupant cannot be
-/// compared here; the claim and placement checks fence it instead.
+/// inventory carries no registry joins, so a named execution's occupant and each
+/// pane's occupying registration cannot be compared here; the claim, placement
+/// and [`occupants_current`] checks fence them instead.
 fn backend_comparable(request: &CloseRequest) -> lifecycle::TargetIdentity {
     let mut identity = request.identity.clone();
     if let (Some(_), lifecycle::TargetIdentity::Pane(pane)) = (&request.execution, &mut identity) {
         pane.occupant = None;
     }
+    for pane in identity.panes_mut() {
+        pane.registration_id = None;
+    }
     identity
+}
+
+/// Whether every registration the confirmation saw occupying a pane is still a
+/// live execution there, by the daemon's own records: an occupant that ended,
+/// or whose recorded placement moved, means the operator confirmed something
+/// that is no longer what this close would act on.
+fn occupants_current(registry: &Registry, request: &CloseRequest) -> bool {
+    let mut identity = request.identity.clone();
+    identity.panes_mut().into_iter().all(|pane| {
+        let Some(registration) = &pane.registration_id else {
+            return true;
+        };
+        subjects::read_process(registry, registration)
+            .ok()
+            .flatten()
+            .is_some_and(|execution| {
+                execution.exited_at.is_none()
+                    && execution.ended_externally_at.is_none()
+                    && execution.completion.is_none()
+                    && execution
+                        .placement
+                        .as_ref()
+                        .is_none_or(|placement| placement.pane() == Some(pane.pane_id.as_str()))
+            })
+    })
 }
 
 pub(super) fn run_close(
@@ -159,6 +188,13 @@ pub(super) fn run_close(
                 Settlement::backend_refused("the selected place changed: nothing was closed"),
                 store::now_ms(),
             ),
+            core,
+        );
+    }
+    if !occupants_current(&Arc::clone(&locked(core).registry), &close_request) {
+        return write_refused(
+            record,
+            "the selected execution changed: nothing was closed",
             core,
         );
     }
@@ -1342,6 +1378,7 @@ mod tests {
             }),
             identity: TargetIdentity::Pane(PaneIdentity {
                 pane_id: "p".into(),
+                registration_id: None,
                 occupant: Some(AgentIdentity {
                     registration_id: RegistrationId::random(),
                     session: None,
@@ -1349,6 +1386,59 @@ mod tests {
                 }),
             }),
         }
+    }
+
+    #[test]
+    fn a_close_refuses_an_occupant_that_is_no_longer_placed_there() {
+        let directory = std::env::temp_dir().join(format!(
+            "radar-occupant-{}",
+            RegistrationId::random().as_str()
+        ));
+        let registry = Registry::open_at(&directory, 1000).unwrap();
+        let ticket = subjects::reserved_ticket(
+            &registry,
+            subjects::LaunchContext {
+                executable: "pi".into(),
+                argv: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+            },
+            None,
+            1000,
+        );
+        let placed_at = |pane: &str| subjects::Placement {
+            location: crate::control_plane::registry::RegistryLocation {
+                backend: "tmux".into(),
+                instance: None,
+                workspace: None,
+                tab: None,
+                pane: Some(pane.into()),
+            },
+            instance: None,
+        };
+        subjects::place(&registry, &ticket.registration_id, placed_at("p"), 1001).unwrap();
+        let naming = |registration: RegistrationId| {
+            let mut close = request(false);
+            if let TargetIdentity::Pane(pane) = &mut close.identity {
+                pane.registration_id = Some(registration);
+            }
+            close
+        };
+        assert!(occupants_current(
+            &registry,
+            &naming(ticket.registration_id.clone())
+        ));
+        subjects::place(&registry, &ticket.registration_id, placed_at("q"), 1002).unwrap();
+        assert!(
+            !occupants_current(&registry, &naming(ticket.registration_id.clone())),
+            "the confirmed occupant moved"
+        );
+        assert!(
+            !occupants_current(&registry, &naming(RegistrationId::random())),
+            "an occupant the daemon does not record"
+        );
+        drop(registry);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

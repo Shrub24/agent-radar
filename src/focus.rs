@@ -72,6 +72,14 @@ pub fn targets(tree: &FleetTree, state: &ObservationState) -> HashMap<RowId, Tar
                 RowKind::Pane(pane) if panes.contains(&*pane.pane_id) => {
                     Some(Target::Pane(pane.pane_id.clone()))
                 }
+                RowKind::Lifecycle(row)
+                    if row
+                        .pane_id
+                        .as_deref()
+                        .is_some_and(|pane| panes.contains(pane)) =>
+                {
+                    row.pane_id.clone().map(Target::Pane)
+                }
                 _ => None,
             };
             if let Some(target) = target {
