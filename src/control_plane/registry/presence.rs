@@ -263,6 +263,7 @@ pub fn begin(
             registry,
             &reserved,
             "the intended session did not present; another session came back on the launched process",
+            now_ms,
         )?;
     }
     if let Some(existing) = current(registry, registration_id)?

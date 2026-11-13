@@ -603,21 +603,6 @@ impl AgentObservation {
     }
 }
 
-/// Public lifecycle identity carried into the display projection.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct LifecycleObservation {
-    pub subject_id: crate::identity::SubjectId,
-    pub bound_registration_id: Option<crate::identity::RegistrationId>,
-    pub process: Option<ProcessIdentity>,
-    pub state: LifecycleState,
-    pub session: Option<String>,
-    /// Whether the daemon recorded this subject's process as ended. A subject
-    /// outlives its process, so the tree needs the exit to tell a subject that is
-    /// still running from one that is history.
-    #[serde(default)]
-    pub ended: bool,
-}
-
 /// One execution: a process incarnation and what it is doing, joined to the
 /// attachment it holds or is about to hold.
 ///
@@ -797,10 +782,6 @@ pub struct FleetObservation {
     /// container was read — not that none exists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub containers: Vec<PublicContainer>,
-    /// Public lifecycle records from the same daemon read as agent facts. The
-    /// tree suppresses subjects already represented by a joined agent row.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lifecycle_subjects: Vec<LifecycleObservation>,
     /// Every execution this daemon records, whether or not a session has attached
     /// it yet. A row is one execution joined to its optional attachment, so a
     /// launch in flight is published here before it presents.

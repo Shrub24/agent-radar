@@ -1203,11 +1203,6 @@ export interface FleetObservation {
    */
   executions?: ExecutionObservation[];
   focus?: Focus;
-  /**
-   * Public lifecycle records from the same daemon read as agent facts. The
-   * tree suppresses subjects already represented by a joined agent row.
-   */
-  lifecycle_subjects?: LifecycleObservation[];
   panes: Pane[];
   tabs: Tab[];
   workspaces: Workspace[];
@@ -1607,11 +1602,6 @@ export interface ManagedSubject {
   ended: boolean;
   metadata: ManagedMetadata;
   process: ProcessIdentity3;
-  /**
-   * The execution this attachment is. A row and the action it offers are keyed
-   * by it, so a grant changing later cannot retarget a confirmed action.
-   */
-  registration_id: string;
   session: string | null;
   state: State;
   subject_id: string;
@@ -1741,22 +1731,6 @@ export interface ExecutionObservation {
 export interface Placement {
   instance?: ProcessIdentity3 | null;
   location: RegistryLocation;
-}
-/**
- * Public lifecycle identity carried into the display projection.
- */
-export interface LifecycleObservation {
-  bound_registration_id: string | null;
-  /**
-   * Whether the daemon recorded this subject's process as ended. A subject
-   * outlives its process, so the tree needs the exit to tell a subject that is
-   * still running from one that is history.
-   */
-  ended: boolean;
-  process: ProcessIdentity3 | null;
-  session: string | null;
-  state: State;
-  subject_id: string;
 }
 /**
  * A runtime pane: location plus optional display text.

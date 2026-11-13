@@ -1129,8 +1129,12 @@ pub fn reservation_for(
 ) -> Result<Option<ClaimId>, String> {
     let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
     Ok(log.claim_of_registration(registration_id).filter(|claim| {
-        log.facts(claim)
-            .is_some_and(|facts| facts.standing.reserves_attachment() && facts.subject_id.is_some())
+        // Only a claim still waiting for its session: once that session presents,
+        // the claim is the registration's ordinary attachment.
+        log.facts(claim).is_some_and(|facts| {
+            facts.standing == crate::control_plane::events::Standing::Reserved
+                && facts.subject_id.is_some()
+        })
     }))
 }
 
@@ -1408,7 +1412,12 @@ pub fn release_claim(registry: &Registry, claim_id: &ClaimId) -> Result<(), Stri
 
 /// Ends an attachment that was meant to happen but could not, recording why so the
 /// operator sees the failed restart or continuation. Idempotent like a release.
-pub fn fail_claim(registry: &Registry, claim_id: &ClaimId, reason: &str) -> Result<(), String> {
+pub fn fail_claim(
+    registry: &Registry,
+    claim_id: &ClaimId,
+    reason: &str,
+    now_ms: i64,
+) -> Result<(), String> {
     let standing = {
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
         log.facts(claim_id).map(|facts| facts.standing)
@@ -1419,7 +1428,7 @@ pub fn fail_claim(registry: &Registry, claim_id: &ClaimId, reason: &str) -> Resu
     append_claim(
         registry,
         claim_id,
-        &crate::control_plane::store::now(),
+        &format_millis(now_ms),
         crate::control_plane::events::Source::Registration,
         crate::control_plane::events::Transition::Failed {
             reason: reason.to_string(),
@@ -4199,6 +4208,48 @@ mod tests {
         assert!(
             !is_attached(&registry, &attachment, 4).unwrap(),
             "and is detached"
+        );
+    }
+
+    #[test]
+    fn a_session_switch_after_the_reservation_presented_is_not_a_failed_intent() {
+        use crate::control_plane::registry::presence::{Standing, begin, decision};
+        let scratch = Scratch::new("fulfilled-reservation-switch");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("incumbent");
+        let subject = first.subject_id.clone().expect("subject");
+        release_claim(&registry, first.claim_id.as_ref().unwrap()).expect("release");
+        let incumbent = current_attachment(&registry, &subject)
+            .unwrap()
+            .unwrap()
+            .claim_id;
+        let intended = random_uuid();
+        let ticket = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            Some(intended.clone()),
+            Some((subject.clone(), incumbent)),
+            ManagedMetadata::default(),
+            2,
+        )
+        .expect("reservation");
+        let reserved = ticket.claim_id.clone().expect("claim");
+        let fulfilled = begin(&registry, &ticket.registration_id, None, &intended, 3)
+            .expect("the intended session presents");
+        assert_eq!(fulfilled.claim_id, reserved);
+        // Before the grant, the process moves to another session.
+        begin(&registry, &ticket.registration_id, None, &random_uuid(), 4).expect("next session");
+        let settled = decision(&registry, &reserved).unwrap().unwrap();
+        assert_eq!(settled.standing, Standing::Released);
+        let published =
+            crate::control_plane::registry_read::read(&registry, None, 5).expect("publication");
+        assert!(
+            published
+                .executions
+                .iter()
+                .all(|row| row.failed_intent.is_none()),
+            "the intent was met; switching sessions afterwards is ordinary replacement"
         );
     }
 

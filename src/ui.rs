@@ -2050,7 +2050,6 @@ mod tests {
         state.apply_success(FleetObservation {
             focus: Default::default(),
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wH".into(),
@@ -2322,7 +2321,6 @@ mod tests {
         let mut observation = FleetObservation {
             focus: Default::default(),
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
             workspaces: vec![crate::model::Workspace {
                 workspace_id: "wL".into(),
@@ -6896,7 +6894,6 @@ mod tests {
         state.apply_success(FleetObservation {
             focus: Default::default(),
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
@@ -6947,7 +6944,6 @@ mod tests {
                     spawn: None,
                     managed: Some(crate::registry_observation::ManagedSubject {
                         subject_id: crate::identity::SubjectId::random(),
-                        registration_id: crate::identity::RegistrationId::random(),
                     claim_id: crate::identity::ClaimId::random(),
                         process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
                         metadata: crate::control_plane::lifecycle::ManagedMetadata::default(),

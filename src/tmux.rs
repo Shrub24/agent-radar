@@ -417,7 +417,6 @@ impl RuntimeProvider for TmuxRuntime {
             return Ok(FleetObservation {
                 focus: Focus::NoOperator,
                 containers: Vec::new(),
-                lifecycle_subjects: Vec::new(),
                 executions: Vec::new(),
                 workspaces: Vec::new(),
                 tabs: Vec::new(),
@@ -431,7 +430,6 @@ impl RuntimeProvider for TmuxRuntime {
         Ok(FleetObservation {
             focus: self.decode_focus(&clients)?,
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
             workspaces: self.decode_sessions(&sessions)?,
             tabs: self.decode_windows(&windows)?,

@@ -58,7 +58,7 @@ pub fn is_unreadable_state(diagnostic: &str) -> bool {
     diagnostic.starts_with(UNREADABLE_STATE)
 }
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAX_EVENT_BYTES: usize = 16 * 1024;
 
 /// A secret-free baseline for explicitly imported records and new subjects.
@@ -462,7 +462,12 @@ impl Log {
                     event.event_id
                 ));
             }
-            log.replay(&event)?;
+            log.replay(&event).map_err(|error| {
+                format!(
+                    "{UNREADABLE_STATE} {} is inconsistent with the journal before it ({error})",
+                    path.display()
+                )
+            })?;
             log.next_seq += 1;
         }
         Ok(log)

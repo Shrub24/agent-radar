@@ -465,29 +465,12 @@ fn collect(
         .as_ref()
         .map(|read| read.executions.clone())
         .unwrap_or_default();
-    let lifecycle_subjects = registry
-        .as_ref()
-        .map(|read| {
-            read.lifecycle
-                .iter()
-                .map(|subject| crate::model::LifecycleObservation {
-                    subject_id: subject.subject_id.clone(),
-                    bound_registration_id: subject.bound_registration_id.clone(),
-                    process: subject.process.clone(),
-                    state: subject.state,
-                    session: subject.session.clone(),
-                    ended: subject.ended(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     // Agents come from the registry alone: with no registry read, none are
     // presented.
     observation.agents = registry.map_or_else(Vec::new, |read| {
         registry_observation::project(&observation, &provider.identity(), read, &evidence)
     });
     observation.containers = containers;
-    observation.lifecycle_subjects = lifecycle_subjects;
     observation.executions = executions;
     observation.resolve_occupants(&provider.identity());
     stamp_assignment_ages(&mut observation);
@@ -575,7 +558,6 @@ mod tests {
             Ok(FleetObservation {
                 focus: Default::default(),
                 containers: Vec::new(),
-                lifecycle_subjects: Vec::new(),
                 executions: Vec::new(),
                 workspaces: Vec::new(),
                 tabs: Vec::new(),

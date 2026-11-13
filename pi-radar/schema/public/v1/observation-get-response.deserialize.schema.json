@@ -627,13 +627,6 @@
         "focus": {
           "$ref": "#/$defs/Focus"
         },
-        "lifecycle_subjects": {
-          "description": "Public lifecycle records from the same daemon read as agent facts. The\ntree suppresses subjects already represented by a joined agent row.",
-          "items": {
-            "$ref": "#/$defs/LifecycleObservation"
-          },
-          "type": "array"
-        },
         "panes": {
           "items": {
             "$ref": "#/$defs/Pane"
@@ -992,49 +985,6 @@
       ],
       "type": "string"
     },
-    "LifecycleObservation": {
-      "description": "Public lifecycle identity carried into the display projection.",
-      "properties": {
-        "bound_registration_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "ended": {
-          "default": false,
-          "description": "Whether the daemon recorded this subject's process as ended. A subject\noutlives its process, so the tree needs the exit to tell a subject that is\nstill running from one that is history.",
-          "type": "boolean"
-        },
-        "process": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ProcessIdentity"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "session": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "state": {
-          "$ref": "#/$defs/State"
-        },
-        "subject_id": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "subject_id",
-        "state"
-      ],
-      "type": "object"
-    },
     "LocalFacts": {
       "description": "What this machine knows about the process holding a pane's foreground,\nbeyond what the runtime reports.",
       "properties": {
@@ -1157,10 +1107,6 @@
         "process": {
           "$ref": "#/$defs/ProcessIdentity"
         },
-        "registration_id": {
-          "description": "The execution this attachment is. A row and the action it offers are keyed\nby it, so a grant changing later cannot retarget a confirmed action.",
-          "type": "string"
-        },
         "session": {
           "type": [
             "string",
@@ -1177,7 +1123,6 @@
       "required": [
         "subject_id",
         "claim_id",
-        "registration_id",
         "process",
         "metadata",
         "state"

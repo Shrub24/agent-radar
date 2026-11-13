@@ -989,7 +989,6 @@ mod tests {
             }],
             agents: Vec::new(),
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
         };
         let inventory =

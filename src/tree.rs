@@ -1381,7 +1381,6 @@ mod tests {
             panes: Vec::new(),
             agents: Vec::new(),
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
         };
         let mut state = ObservationState::new();
@@ -1475,7 +1474,6 @@ mod tests {
                 workspace_container("c1", "wA", "work", None),
                 pane_container("c2", "wA:p1", None),
             ],
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
         };
         let mut state = ObservationState::new();
@@ -1635,7 +1633,6 @@ mod tests {
             panes: vec![pane("wA:p1", "wA:t1"), pane("wA:p2", "wA:t1")],
             agents,
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
         });
         state
@@ -1896,7 +1893,6 @@ mod tests {
         let observation = FleetObservation {
             focus: Default::default(),
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),

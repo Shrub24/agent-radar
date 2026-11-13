@@ -269,7 +269,6 @@ impl RuntimeProvider for GatedBackend {
         Ok(FleetObservation {
             focus: Default::default(),
             containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
             executions: Vec::new(),
             workspaces: Vec::new(),
             tabs: Vec::new(),
@@ -340,7 +339,6 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
     FleetObservation {
         focus: Default::default(),
         containers: Vec::new(),
-        lifecycle_subjects: Vec::new(),
         executions: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
@@ -801,7 +799,6 @@ impl MuxBackend {
             inventory: FleetObservation {
                 focus: Default::default(),
                 containers: Vec::new(),
-                lifecycle_subjects: Vec::new(),
                 executions: Vec::new(),
                 workspaces: Vec::new(),
                 tabs: Vec::new(),
@@ -1299,7 +1296,6 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
     let inventory = FleetObservation {
         focus: Default::default(),
         containers: Vec::new(),
-        lifecycle_subjects: Vec::new(),
         executions: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
@@ -9324,7 +9320,6 @@ fn empty_inventory() -> FleetObservation {
     FleetObservation {
         focus: Default::default(),
         containers: Vec::new(),
-        lifecycle_subjects: Vec::new(),
         executions: Vec::new(),
         workspaces: Vec::new(),
         tabs: Vec::new(),
@@ -11219,7 +11214,6 @@ fn workspace_inventory(workspace_id: &str) -> FleetObservation {
     FleetObservation {
         focus: Default::default(),
         containers: Vec::new(),
-        lifecycle_subjects: Vec::new(),
         executions: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: workspace_id.into(),

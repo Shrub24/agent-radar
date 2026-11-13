@@ -31,12 +31,9 @@ pub enum Action {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Subject {
     pub subject_id: crate::identity::SubjectId,
+    /// The attachment the row showed. A claim belongs to exactly one execution, so
+    /// it already freezes which process a confirmed control may affect.
     pub claim_id: crate::identity::ClaimId,
-    /// The execution the row showed when the operator acted. The daemon refuses a
-    /// control whose execution is no longer the one its address resolves to, so a
-    /// grant changing between selection and confirmation cannot retarget it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub registration_id: Option<crate::identity::RegistrationId>,
 }
 
 #[derive(Serialize)]
