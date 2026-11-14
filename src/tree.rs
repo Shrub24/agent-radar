@@ -535,7 +535,7 @@ impl FleetTree {
                 .get(workspace_id.as_str())
                 .copied()
                 .or_else(|| workspace_id.is_empty().then_some("unplaced"));
-            let mut agents: Vec<(Nestable, String)> = Vec::new();
+            let mut agents: Vec<(Nestable, Option<String>)> = Vec::new();
 
             for agent in &inventory.agents {
                 if agent.location.workspace_id != *workspace_id {
@@ -565,7 +565,10 @@ impl FleetTree {
                         parent: parent_claim(agent),
                         registration_id: claimed_registration_id(agent),
                     },
-                    agent.location.tab_id.clone(),
+                    // An unresolved registration owns no pane, so it is no member
+                    // of the window it reported: it neither draws the tab nor
+                    // gathers that window's rows beneath it.
+                    joined.then(|| agent.location.tab_id.clone()),
                 ));
             }
 
@@ -600,7 +603,7 @@ impl FleetTree {
                         parent: parent_claim(agent),
                         registration_id: claimed_registration_id(agent),
                     },
-                    agent.location.tab_id.clone(),
+                    Some(agent.location.tab_id.clone()),
                 ));
             }
 
@@ -1075,11 +1078,17 @@ fn published_phase(entries: &[String], id: &str) -> Option<String> {
 /// its agents flat beneath the workspace, in original row order.
 ///
 /// Returns the workspace's children and, for each tab row, its tab id and position.
-fn nest_by_window(agents: Vec<(Nestable, String)>) -> (Vec<TreeNode>, Vec<(String, usize)>) {
+fn nest_by_window(
+    agents: Vec<(Nestable, Option<String>)>,
+) -> (Vec<TreeNode>, Vec<(String, usize)>) {
     let mut slots: Vec<Option<Nestable>> = Vec::with_capacity(agents.len());
-    let mut windows: Vec<(String, Vec<usize>)> = Vec::new();
+    // A row with no window is a group of its own and is never drawn as a tab.
+    let mut windows: Vec<(Option<String>, Vec<usize>)> = Vec::new();
     for (index, (nestable, tab)) in agents.into_iter().enumerate() {
-        match windows.iter_mut().find(|(window, _)| *window == tab) {
+        match windows
+            .iter_mut()
+            .find(|(window, _)| tab.is_some() && *window == tab)
+        {
             Some((_, members)) => members.push(index),
             None => windows.push((tab, vec![index])),
         }
@@ -1096,8 +1105,8 @@ fn nest_by_window(agents: Vec<(Nestable, String)>) -> (Vec<TreeNode>, Vec<(Strin
             .map(|&index| slots[index].take().expect("each agent is grouped once"))
             .collect();
         let mut roots = nest(group);
-        if roots.len() == 1 {
-            placed.push((first, Some(tab), roots.remove(0)));
+        if roots.len() == 1 && tab.is_some() {
+            placed.push((first, tab, roots.remove(0)));
         } else {
             placed.extend(roots.into_iter().map(|node| (first, None, node)));
         }
@@ -1176,6 +1185,12 @@ fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
             .push(index);
     }
 
+    // The default view hides history with everything beneath it, so a live row
+    // never nests under one: it would vanish with a parent that has ended.
+    let history: Vec<bool> = agents
+        .iter()
+        .map(|nestable| matches!(&nestable.node.row.kind, RowKind::Agent(agent) if agent.history()))
+        .collect();
     let mut parent: Vec<Option<usize>> = vec![None; count];
     for (index, nestable) in agents.iter().enumerate() {
         let owners = nestable
@@ -1185,6 +1200,7 @@ fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
         if let Some(owners) = owners
             && owners.len() == 1
             && owners[0] != index
+            && (history[index] || !history[owners[0]])
         {
             parent[index] = Some(owners[0]);
         }
@@ -1636,6 +1652,69 @@ mod tests {
             executions: Vec::new(),
         });
         state
+    }
+
+    #[test]
+    fn a_restarted_agent_is_its_window_row_beside_its_ended_predecessor() {
+        const PREDECESSOR: &str = "00000000-0000-4000-8000-0000000000e1";
+        const SUCCESSOR: &str = "00000000-0000-4000-8000-0000000000e2";
+        // The predecessor's registration still reports the pane it ran in, but its
+        // process ended, and the restart's spawn edge names it as the parent.
+        let mut predecessor = registered_agent(PREDECESSOR, "wA:p1", "wA:t1", None);
+        predecessor.registry.binding =
+            Binding::Unjoined(crate::registry_observation::Unjoined::IdentityMismatch);
+        let successor = registered_agent(SUCCESSOR, "wA:p1", "wA:t1", Some(PREDECESSOR));
+        let tree = FleetTree::build(&two_agent_window(vec![predecessor, successor]));
+        let workspace = &tree.roots[0];
+        let row = workspace
+            .children
+            .iter()
+            .find(|child| child.row.id == RowId::Agent("wA:p1".into()))
+            .expect("the live successor is a row of the workspace, not hidden beneath its history");
+        let RowKind::Agent(agent) = &row.row.kind else {
+            panic!("an agent row");
+        };
+        assert!(
+            agent.represents_tab,
+            "an unresolved registration is no member of the window"
+        );
+        assert!(
+            !row.children.iter().any(|child| matches!(
+                &child.row.id,
+                RowId::Registered(id) if id.as_str() == PREDECESSOR
+            )),
+            "the ended predecessor does not nest beneath it either"
+        );
+    }
+
+    #[test]
+    fn a_live_child_is_never_nested_under_a_parent_that_ended() {
+        const PARENT: &str = "00000000-0000-4000-8000-0000000000e3";
+        const CHILD: &str = "00000000-0000-4000-8000-0000000000e4";
+        let mut parent = registered_agent(PARENT, "wA:p1", "wA:t1", None);
+        parent.registry.managed = Some(crate::registry_observation::ManagedSubject {
+            subject_id: crate::identity::SubjectId::random(),
+            claim_id: crate::identity::ClaimId::random(),
+            process: crate::model::ProcessIdentity {
+                boot_id: "boot".into(),
+                pid: 1,
+                start_ticks: 1,
+            },
+            metadata: Default::default(),
+            child_close: None,
+            state: crate::control_plane::lifecycle::State::Bound,
+            session: None,
+            ended: true,
+        });
+        let child = registered_agent(CHILD, "wA:p2", "wA:t1", Some(PARENT));
+        let tree = FleetTree::build(&two_agent_window(vec![parent, child]));
+        assert!(
+            tree.roots[0]
+                .children
+                .iter()
+                .any(|row| row.row.id == RowId::Agent("wA:p2".into())),
+            "the default view hides history with its subtree, so the live child stays a row of its own"
+        );
     }
 
     #[test]
