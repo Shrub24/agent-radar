@@ -129,9 +129,7 @@ impl TaskProjection {
 )]
 pub enum RowId {
     Workspace(String),
-    /// A pane that holds a registration: a joined agent, or a live execution the
-    /// pane names as its occupant before it presents. Keyed by the connector-scoped
-    /// pane id, so the row keeps its identity as its occupant presents or restarts.
+    /// A pane holding a registration. Keyed by pane, so it survives presence and restart.
     Agent(String),
     /// An unresolved registration's row, keyed by its agent id: it has no pane
     /// to key by, and two registrations may name the same reported pane.
@@ -140,9 +138,7 @@ pub enum RowId {
     Pane(String),
     /// Background-task row, keyed by owner, session and task id.
     Task(TaskId),
-    /// An execution no pane names as its occupant: unplaced, ended, or placed in a
-    /// pane another registration occupies. Keyed by the registration, which
-    /// identifies the process incarnation.
+    /// An execution no pane names as occupant, keyed by registration.
     Lifecycle(crate::identity::RegistrationId),
 }
 
@@ -269,25 +265,20 @@ pub enum RowKind {
 /// A daemon lifecycle subject without a joined agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LifecycleRow {
-    /// The execution this row is. A row is one process incarnation joined to the
-    /// attachment it holds or is about to hold; the subject is the identity the
-    /// attachment carries, and is absent while a launch has not presented.
+    /// Its subject is absent until it presents.
     pub execution: crate::model::ExecutionObservation,
     pub title: String,
-    /// The pane this execution occupies now, when the observation names it as
-    /// that pane's occupant. A recorded placement alone is not occupancy.
+    /// Set only when the pane names this execution; a placement alone is not occupancy.
     pub pane_id: Option<String>,
 }
 
 impl LifecycleRow {
-    /// Whether this execution is history: its process is recorded as ended. The
-    /// subject is kept so it can be continued.
+    /// Its process is recorded as ended.
     pub fn history(&self) -> bool {
         self.execution.ended
     }
 
-    /// Whether this row is a launched process nobody has attached yet: it may not
-    /// have presented, so it holds no subject.
+    /// Launched but not attached yet.
     pub fn unjoined(&self) -> bool {
         self.execution.subject_id.is_none()
     }
@@ -346,8 +337,7 @@ pub struct AgentRow {
     /// The registration this row presents, on the daemon path. Its binding says
     /// whether the pane is proven; its channels carry each authority's freshness.
     pub registry: Option<RegistryView>,
-    /// The restart or continuation that launched this process did not attach;
-    /// the reason is in the execution the daemon published for it.
+    /// The intended restart or continuation failed; see the execution's `failed_intent`.
     pub intent_failed: bool,
 }
 
@@ -505,8 +495,7 @@ impl FleetTree {
         // Phase 1: workspace roots with their agent rows (current, then
         // retained). `claimed` is global so a pane yields exactly one row in
         // the whole tree, whatever workspace its facts place it in.
-        // The collector resolves which registration occupies a pane; the tree
-        // reads that and never re-derives occupancy.
+        // Occupancy is the collector's answer; never re-derive it here.
         let executions: HashMap<
             &crate::identity::RegistrationId,
             &crate::model::ExecutionObservation,
@@ -521,8 +510,7 @@ impl FleetTree {
                 .is_some_and(|execution| execution.failed_intent.is_some())
         };
         let mut claimed: HashSet<&str> = HashSet::new();
-        // Registrations an agent row already shows: their execution is that row,
-        // enriched, not a second one.
+        // Executions already shown as agent rows.
         let mut represented: HashSet<&crate::identity::RegistrationId> = HashSet::new();
         let mut roots: Vec<TreeNode> = Vec::new();
         let mut workspace_index: HashMap<&str, usize> = HashMap::new();
@@ -567,9 +555,7 @@ impl FleetTree {
                         parent: parent_claim(agent),
                         registration_id: claimed_registration_id(agent),
                     },
-                    // An unresolved registration owns no pane, so it is no member
-                    // of the window it reported: it neither draws the tab nor
-                    // gathers that window's rows beneath it.
+                    // Unjoined: it owns no pane, so it belongs to no window.
                     joined.then(|| agent.location.tab_id.clone()),
                 ));
             }
@@ -579,8 +565,7 @@ impl FleetTree {
                 if agent.location.workspace_id != *workspace_id {
                     continue;
                 }
-                // A retained association is history: a pane another registration
-                // occupies now is that registration's row.
+                // A pane another registration occupies now is that registration's row.
                 if inventory.pane(pane_id).is_some_and(|pane| {
                     pane.registration_id.as_ref().is_some_and(|occupant| {
                         occupant != &agent.registry.agent.registration.registration_id
@@ -631,10 +616,8 @@ impl FleetTree {
             });
         }
 
-        // Phase 2: ordinary pane rows for panes no agent row claimed. Each
-        // pane record appears at most once (first record wins). A pane that hosts
-        // an execution Radar tracks is that execution's row: one row per pane, and
-        // no separate plain-pane row beside it.
+        // Phase 2: one row per pane no agent row claimed; an occupied pane is its
+        // execution's row.
         let mut pane_seen: HashSet<&str> = HashSet::new();
         for pane in &inventory.panes {
             let pane_id = pane.location.pane_id.as_str();
@@ -720,9 +703,7 @@ impl FleetTree {
             siblings.push(pane_node);
         }
 
-        // An execution no pane showed is still an execution: a launch that has not
-        // presented, one whose pane this refresh did not report, or one that has
-        // already ended. A subject with no execution produces no row here.
+        // Executions no pane row showed.
         for execution in &inventory.executions {
             if represented.contains(&execution.registration_id) || execution.is_withdrawn_launch() {
                 continue;
@@ -751,7 +732,6 @@ impl FleetTree {
     }
 }
 
-/// One row for one execution, joined to the attachment it holds or is waiting for.
 fn execution_row(
     execution: &crate::model::ExecutionObservation,
     inventory: &crate::model::FleetObservation,
@@ -787,8 +767,7 @@ fn execution_row(
         None => title,
     };
     TreeRow {
-        // The pane is the row: a launch keeps its row when it presents and its
-        // agent row takes the pane's place, and when a restart reuses the pane.
+        // Keyed by pane, so the row survives presence and a pane-reusing restart.
         id: match occupied {
             Some(pane) => RowId::Agent(pane.to_string()),
             None => RowId::Lifecycle(execution.registration_id.clone()),
@@ -1187,8 +1166,7 @@ fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
             .push(index);
     }
 
-    // The default view hides history with everything beneath it, so a live row
-    // never nests under one: it would vanish with a parent that has ended.
+    // Hidden history hides its subtree, so a live row never nests under it.
     let history: Vec<bool> = agents
         .iter()
         .map(|nestable| matches!(&nestable.node.row.kind, RowKind::Agent(agent) if agent.history()))
@@ -1660,8 +1638,6 @@ mod tests {
     fn a_restarted_agent_is_its_window_row_beside_its_ended_predecessor() {
         const PREDECESSOR: &str = "00000000-0000-4000-8000-0000000000e1";
         const SUCCESSOR: &str = "00000000-0000-4000-8000-0000000000e2";
-        // The predecessor's registration still reports the pane it ran in, but its
-        // process ended, and the restart's spawn edge names it as the parent.
         let mut predecessor = registered_agent(PREDECESSOR, "wA:p1", "wA:t1", None);
         predecessor.registry.binding =
             Binding::Unjoined(crate::registry_observation::Unjoined::IdentityMismatch);
@@ -2165,7 +2141,6 @@ mod tests {
             .retain(|agent| agent.location.pane_id != "wA:p1");
         state.apply_success(without_owner.clone());
         state.apply_evidence("wA:p1", crate::model::ForegroundEvidence::Shell);
-        // A launch now occupies the pane the retained owner last reported.
         let mut placement = execution_at(R, "wA:p1", false);
         placement.placement.as_mut().unwrap().location.workspace = Some("wA".into());
         without_owner.executions = vec![placement];
@@ -2427,7 +2402,6 @@ mod tests {
             ended: false,
             failed_intent: None,
         };
-        // Revoked before it ever presented: no process, no attachment, no row.
         let revoked = crate::model::ExecutionObservation {
             registration_id: registration(0xa3),
             state: crate::control_plane::lifecycle::State::Revoked,

@@ -846,8 +846,6 @@ pub(super) fn registration_identifier(agent: &AgentRow) -> String {
 /// stands, what it last executed, what its owner assigned, its own facts, and the
 /// state derived from them. Each carries its own freshness, so an expired report
 /// reads as stale rather than as the state it last described.
-/// Why the restart or continuation that launched this agent's process did not
-/// attach, read from the execution the daemon published for its registration.
 fn failed_intent(state: &ObservationState, agent: &AgentRow) -> Option<String> {
     let registration = &agent.registry.as_ref()?.agent.registration.registration_id;
     state

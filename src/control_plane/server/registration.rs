@@ -58,8 +58,7 @@ pub(super) fn presence_request(
         if process_observation.is_err() {
             return Ok(claim);
         }
-        // Who holds the session is recorded state, not something a caller's arrival
-        // re-derives: an ended execution releases its claim where it is observed.
+        // The holder is recorded state: exits release claims where they are observed.
         let attachment =
             subjects::attachment(&registry, &registration_id, &report.session_id, now)?;
         if matches!(attachment, subjects::Attachment::Other(_)) {
@@ -97,8 +96,6 @@ pub(super) fn presence_request(
             &report.session_id,
             now,
         )?;
-        // Where this execution runs is the execution's own fact: presence verified
-        // the pane, so it is recorded there rather than held on the claim.
         subjects::place(
             &registry,
             &registration_id,

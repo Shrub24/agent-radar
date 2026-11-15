@@ -45,8 +45,7 @@ pub enum UiRowId {
         session: Option<String>,
         id: String,
     },
-    /// An execution row: the registration identifies the process incarnation, and
-    /// the attachment it holds is carried by the observation rather than the id.
+    /// An execution row, keyed by its registration.
     Lifecycle {
         registration_id: crate::identity::RegistrationId,
     },

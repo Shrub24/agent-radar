@@ -370,8 +370,7 @@ pub fn record(
 
 /// Attach a launch reservation. The child presents its pre-minted registration,
 /// not the claim; binding still requires the captured process birth identity.
-/// Records the execution a tracked spawn launches, and the token its child will
-/// register with. The edge binds to the child when that token is presented.
+/// Records a tracked spawn's execution and the token its child binds with.
 pub fn attach_execution(
     registry: &Registry,
     request_id: &str,

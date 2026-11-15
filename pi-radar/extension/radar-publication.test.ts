@@ -80,8 +80,6 @@ function fakeDaemon(script: Script = {}) {
 		presence: async (params) => answer("agent.presence", params, () => {
 			const agentId = params.registration_id ?? agentIds[0] ?? mint();
 			if (!agentIds.includes(agentId)) agentIds.push(agentId);
-			// Radar mints the attachment: a report that names none is answered with
-			// the claim it now holds, and a named one is answered with the same id.
 			const claim = params.claim_id ?? mint();
 			if (!claims.includes(claim)) claims.push(claim);
 			return ok({ registration_id: agentId, claim_id: claim,
@@ -220,8 +218,6 @@ test("managed startup and reload use fresh claims under one launch registration"
 		const binding = await publication.subject();
 		await settle();
 		assert.ok(binding, publication.diagnostic());
-		// The client owns no attachment identity: it reports the process and the
-		// session, and Radar answers with the claim it minted.
 		assert.equal(daemon.params("agent.presence").claim_id, undefined);
 		assert.equal(daemon.params("agent.presence").registration_id, registrationId);
 		const initial = daemon.claims[0];
@@ -437,8 +433,6 @@ test("a reload reuses the process incarnation and its one publisher", async () =
 		assert.equal(radarProcessIncarnation(slot), incarnation);
 		reloaded.execution.update({ activity: "idle" });
 		await settle();
-		// A reload of the same session reuses the attachment Radar minted rather
-		// than registering the process again or asking for a second claim.
 		assert.equal(daemon.params("agent.presence", 0).claim_id, undefined);
 		assert.equal(daemon.params("agent.presence", 1).claim_id, daemon.claims[0]);
 		assert.equal(daemon.claims.length, 1);

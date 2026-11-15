@@ -64,9 +64,7 @@ const MAX_EVENT_BYTES: usize = 16 * 1024;
 /// A secret-free baseline for explicitly imported records and new subjects.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// What a stream's reduction produced. An attachment and an execution are
-/// separate records: a claim owns who is attached, an execution owns what the
-/// process did.
+/// A claim owns who is attached; an execution owns what the process did.
 pub enum Recorded {
     Attachment(Box<AttachmentFacts>),
     Execution(Box<ProcessFacts>),
@@ -83,8 +81,7 @@ pub enum Standing {
 }
 
 impl Standing {
-    /// Whether this claim may carry subject authority. It is eligibility only:
-    /// the subject's granted attachment must still be this claim.
+    /// Eligibility only: the subject's granted claim must still be this one.
     pub fn grants_authority(self) -> bool {
         matches!(self, Self::Granted)
     }
@@ -108,16 +105,12 @@ pub struct AttachmentFacts {
     pub subject_id: Option<SubjectId>,
     #[serde(default)]
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,
-    /// Where this attachment stands among the claims on its subject. The claim is
-    /// the authority; a subject's current, reserved and previous grant are read
-    /// from these standings in recorded order.
+    /// Changed only by its own transitions.
     pub standing: Standing,
-    /// When this claim was granted, so a released claim still records that it once
-    /// held its subject. Set once; a later release does not clear it.
+    /// Set once; a release does not clear it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<String>,
-    /// Why this attachment ended without ever being fulfilled, when it was an
-    /// intended restart or continuation that could not happen.
+    /// Why an intended attachment ended unfulfilled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
 }
@@ -158,8 +151,7 @@ impl AttachmentFacts {
             subject_id: Some(subject.subject_id.clone()),
             managed: subject.managed.clone(),
             session: subject.session.clone(),
-            // Standing is recorded by its own transition, never implied by
-            // writing an attachment: this baseline describes the facts.
+            // Standing changes only by its own transitions.
             standing: Standing::Pending,
             granted_at: None,
             failure: None,
@@ -190,8 +182,8 @@ impl From<&ProcessRecord> for ProcessFacts {
 }
 
 impl ProcessFacts {
-    /// Whether the execution has ended: a verified exit or a confirmed external end.
-    /// A supervisor's completion reports how it ended, and records the exit with it.
+    /// A verified exit or a confirmed external end. A completion records the exit
+    /// with it, so it is not checked separately.
     pub fn ended(&self) -> bool {
         self.exited_at.is_some() || self.ended_externally_at.is_some()
     }
@@ -256,25 +248,20 @@ pub enum Transition {
     SessionRecorded {
         session: String,
     },
-    /// Records the durable subject this attachment belongs to, once it is known.
-    /// A presence attempt starts before the subject is resolved.
+    /// The subject, once resolved; a presence attempt starts before it is.
     Attached {
         subject_id: SubjectId,
     },
-    /// Holds a subject for a launch that has not presented yet. Not authority: it
-    /// excludes competing attachments until this registration presents or is
-    /// withdrawn.
+    /// Holds a subject for a launch that has not presented: excludes, never authorizes.
     Reserved {
         subject_id: SubjectId,
         session: Option<String>,
     },
-    /// A presence report on a claim with no subject yet, before anything authorizes
-    /// it. Its own event so an interrupted decision leaves a readable attempt.
+    /// A report on a claim with no subject yet, recorded before any decision.
     Presence {
         session: String,
     },
-    /// Authorizes this claim over its subject. The claim, not the subject record,
-    /// is where an attachment becomes current.
+    /// Authorizes this claim over its subject.
     Granted {
         subject_id: SubjectId,
     },
@@ -282,7 +269,7 @@ pub enum Transition {
     Duplicate {
         session: String,
     },
-    /// Ends this claim's authority, keeping it as the record of what it was.
+    /// Ends authority; the claim stays recorded.
     Released,
     /// Ends an intended attachment that could not happen, recording why.
     Failed {
@@ -377,8 +364,7 @@ pub struct Log {
     facts: BTreeMap<ClaimId, AttachmentFacts>,
     subjects: BTreeMap<SubjectId, SubjectAttachments>,
     registrations: BTreeMap<RegistrationId, ClaimId>,
-    /// The intended attachment a registration failed, kept after the claim that
-    /// recorded it is superseded by the registration's ordinary attachment.
+    /// Kept after the failed claim is superseded by an ordinary attachment.
     failures: BTreeMap<RegistrationId, String>,
     processes: BTreeMap<RegistrationId, ProcessFacts>,
     operations: BTreeMap<String, RequestRecord>,
@@ -503,8 +489,7 @@ impl Log {
         Ok(events)
     }
 
-    /// The attachment a claim records. The execution it names is read from the
-    /// process stream, never copied here.
+    /// Execution facts are read from the process stream, never copied here.
     pub fn facts(&self, claim_id: &ClaimId) -> Option<AttachmentFacts> {
         self.facts.get(claim_id).cloned()
     }
@@ -530,13 +515,11 @@ impl Log {
         self.facts.keys()
     }
 
-    /// The registration's attachment: its live claim, else its newest one. At most
-    /// one claim of a registration is live, so a terminal answer means none is.
+    /// The live claim, else the newest; at most one is live.
     pub fn claim_of_registration(&self, registration_id: &RegistrationId) -> Option<ClaimId> {
         self.registrations.get(registration_id).cloned()
     }
 
-    /// The intended attachment this registration failed, if any.
     pub fn failure_of(&self, registration_id: &RegistrationId) -> Option<&str> {
         self.failures.get(registration_id).map(String::as_str)
     }
@@ -850,9 +833,7 @@ impl Log {
     }
 }
 
-/// Applies a claim transition. Standing, its subject and its session are the
-/// claim's own facts; anything it asks about the process is read from the
-/// execution record rather than kept in step here.
+/// Process facts are read from the execution, never kept here.
 fn reduce_attachment(
     previous: Option<&AttachmentFacts>,
     execution: Option<&ProcessFacts>,
@@ -912,8 +893,6 @@ fn reduce_attachment(
     Ok(facts)
 }
 
-/// Applies an execution transition. Everything about the process — identity,
-/// birth, binding, signal, exit, completion, placement — belongs here.
 fn reduce_process(previous: Option<&ProcessFacts>, event: &Event) -> Result<ProcessFacts, String> {
     let mut facts = previous
         .cloned()

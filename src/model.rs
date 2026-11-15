@@ -189,9 +189,7 @@ pub struct Pane {
     /// Current tmux pane directory, used as the target for a new launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_path: Option<String>,
-    /// The live registration occupying this pane, resolved once by the collector
-    /// from the daemon's recorded placement. Rows read it; they do not re-derive
-    /// occupancy, and an ended execution never occupies a pane.
+    /// Resolved by the collector; an ended execution occupies nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_id: Option<crate::identity::RegistrationId>,
 }
@@ -603,21 +601,14 @@ impl AgentObservation {
     }
 }
 
-/// One execution: a process incarnation and what it is doing, joined to the
-/// attachment it holds or is about to hold.
-///
-/// Identity is the registration. The claim references are separate because they
-/// answer different questions: `claim_id` is the attachment that holds the subject
-/// now, `reserved_claim_id` is the exclusive entitlement waiting for a process that
-/// has not presented. Neither is derived from the other, and a row shows both
-/// without pretending one is the other.
+/// One execution and the attachment it holds or awaits: `claim_id` holds the
+/// subject now, `reserved_claim_id` waits for a process that has not presented.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionObservation {
     pub registration_id: crate::identity::RegistrationId,
     pub state: LifecycleState,
     pub origin: ExecutionOrigin,
-    /// Where this execution runs, as the daemon recorded it when it verified the
-    /// pane. A pane is joined to its row by this, and only this.
+    /// Where the daemon verified it runs. Occupancy is [`Pane::registration_id`], not this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<crate::control_plane::lifecycle::Placement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -626,8 +617,7 @@ pub struct ExecutionObservation {
     pub claim_id: Option<crate::identity::ClaimId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved_claim_id: Option<crate::identity::ClaimId>,
-    /// The identity the daemon verified for this execution's process, once it has
-    /// one. A launch that has not presented has none, and its row says so.
+    /// Absent until a launch presents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<crate::model::ProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -638,22 +628,18 @@ pub struct ExecutionObservation {
     /// Whether the daemon recorded this execution's process as ended.
     #[serde(default)]
     pub ended: bool,
-    /// Why an intended restart or continuation of this execution failed, when it
-    /// did. The execution and its effects are untouched; only the intended
-    /// attachment failed.
+    /// Why an intended restart or continuation failed; the execution is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_intent: Option<String>,
 }
 
 impl ExecutionObservation {
-    /// Revoked before it ever presented: it names no process and holds no
-    /// attachment, so the default view has nothing to show for it.
+    /// Revoked before presenting: no process, no attachment.
     pub fn is_withdrawn_launch(&self) -> bool {
         self.state == LifecycleState::Revoked && self.process.is_none() && self.subject_id.is_none()
     }
 
-    /// The pane this execution occupies now. An ended or withdrawn execution
-    /// occupies nothing: the pane it leaves behind is whatever is in it next.
+    /// The pane it occupies, unless it ended or was withdrawn.
     pub fn occupied_pane(&self) -> Option<&str> {
         if self.ended || self.is_withdrawn_launch() {
             return None;
@@ -663,12 +649,8 @@ impl ExecutionObservation {
 }
 
 impl FleetObservation {
-    /// Names, on each pane, the live registration occupying it. A registration
-    /// whose agent is joined to the pane is the occupant: that join is verified
-    /// against the pane's foreground process. Otherwise a live execution whose
-    /// placement names this backend and pane is, provided exactly one stands out:
-    /// one holding a grant over one holding a reservation, and two of equal
-    /// standing are ambiguous, so the pane names neither.
+    /// The joined agent, else the single highest-standing live placement on this
+    /// backend and server. A tie names no occupant.
     pub fn resolve_occupants(&mut self, backend: &crate::runtime::BackendIdentity) {
         use std::collections::HashMap;
         let mut occupants: HashMap<String, Option<crate::identity::RegistrationId>> =
@@ -782,9 +764,7 @@ pub struct FleetObservation {
     /// container was read — not that none exists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub containers: Vec<PublicContainer>,
-    /// Every execution this daemon records, whether or not a session has attached
-    /// it yet. A row is one execution joined to its optional attachment, so a
-    /// launch in flight is published here before it presents.
+    /// Every recorded execution, attached or not.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub executions: Vec<ExecutionObservation>,
     #[serde(default, skip_serializing_if = "Focus::is_unreported")]

@@ -105,7 +105,6 @@ class Acceptance:
                                    "pane": "tmux:{self.server}:" + os.environ["TMUX_PANE"]}}}}
             granted = call(root / "control.sock", "agent.presence", report)
             assert granted["standing"] == "granted", granted
-            # Radar mints the attachment; the client carries the ID it answered with.
             report["claim_id"] = granted["claim_id"]
             report["registration_id"] = granted["registration_id"]
             publisher = {{"source": report["source"], "incarnation": report["incarnation"]}}

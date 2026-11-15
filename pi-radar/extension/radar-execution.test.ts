@@ -495,7 +495,6 @@ test("a replaced session is never renewed as the one it replaced", async () => {
 		const contexts = h.contexts();
 		assert.equal(contexts.length, 2);
 		assert.equal(contexts[1].session_id, SECOND);
-		// Each session's first report names no claim, and Radar mints a new one.
 		assert.equal(contexts[0].claim_id, undefined);
 		assert.equal(contexts[1].claim_id, undefined);
 		assert.notEqual(h.claims[0], h.claims[1]);
@@ -526,9 +525,6 @@ test("a session's start awaits its initial presence response", async () => {
 });
 
 test("a session's shutdown completes its release before the next session starts", async () => {
-	// Pi awaits what a lifecycle handler returns, so the release must be part of
-	// the shutdown promise: the next session_start is ordered after it, and a
-	// discarded promise would let the new session present before the old released.
 	let release: (() => void) | undefined;
 	const released = new Promise<void>(resolve => { release = resolve; });
 	const order: string[] = [];
@@ -543,7 +539,6 @@ test("a session's shutdown completes its release before the next session starts"
 		let returned = false;
 		void shutting.then(() => { returned = true; });
 		await new Promise(resolve => setTimeout(resolve, 20));
-		// The boundary is still open: the release has been asked for and not answered.
 		assert.equal(returned, false, "shutdown returned before its release completed");
 		assert.ok(order.includes("release"), order.join(","));
 		release?.();
@@ -610,8 +605,6 @@ test("a reloaded adapter reuses the process's one publisher", async () => {
 			// and the sequence continues where the process left it.
 			assert.deepEqual(second.calls, []);
 			assert.deepEqual(first.calls.filter(call => call.method === "agent.publish").map(call => call.params.sequence), [1, 2]);
-			// The reload persists and reuses the attachment Radar minted for the
-			// session rather than asking for a second one.
 			assert.equal(first.claims.length, 1);
 			assert.deepEqual(first.snapshots(), [
 				{ activity: "idle" },

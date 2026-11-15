@@ -99,10 +99,8 @@ pub(super) fn execute_close(
     run_close(request, close_request, requester, core, verification)
 }
 
-/// The identity this daemon can compare against its own backend inventory. That
-/// inventory carries no registry joins, so a named execution's occupant and each
-/// pane's occupying registration cannot be compared here; the claim, placement
-/// and [`occupants_current`] checks fence them instead.
+/// The part of the frozen identity the backend inventory can check. Occupants are
+/// fenced by the claim, placement and [`occupants_current`] checks instead.
 fn backend_comparable(request: &CloseRequest) -> lifecycle::TargetIdentity {
     let mut identity = request.identity.clone();
     if let (Some(_), lifecycle::TargetIdentity::Pane(pane)) = (&request.execution, &mut identity) {
@@ -114,10 +112,7 @@ fn backend_comparable(request: &CloseRequest) -> lifecycle::TargetIdentity {
     identity
 }
 
-/// Whether every registration the confirmation saw occupying a pane is still a
-/// live execution there, by the daemon's own records: an occupant that ended,
-/// or whose recorded placement moved, means the operator confirmed something
-/// that is no longer what this close would act on.
+/// Whether each frozen occupant is still a live execution placed in its pane.
 fn occupants_current(registry: &Registry, request: &CloseRequest) -> bool {
     let mut identity = request.identity.clone();
     identity.panes_mut().into_iter().all(|pane| {

@@ -366,9 +366,7 @@ export interface SubjectListResultManagedMetadata {
  */
 export interface PresenceReportDeserialize {
   /**
-   * The claim Radar returned for this attachment, echoed back on heartbeats and
-   * reconnects. A first report names none: Radar resolves its own reservation or
-   * mints the claim, so the client never owns an attachment identity.
+   * The claim Radar returned, echoed on heartbeats and reconnects. A first report names none.
    */
   claim_id?: string | null;
   incarnation: string;
@@ -1197,9 +1195,7 @@ export interface FleetObservation {
    */
   containers?: PublicContainer[];
   /**
-   * Every execution this daemon records, whether or not a session has attached
-   * it yet. A row is one execution joined to its optional attachment, so a
-   * launch in flight is published here before it presents.
+   * Every recorded execution, attached or not.
    */
   executions?: ExecutionObservation[];
   focus?: Focus;
@@ -1677,14 +1673,8 @@ export interface Binding2 {
   incarnation: ProcessIdentity3 | null;
 }
 /**
- * One execution: a process incarnation and what it is doing, joined to the
- * attachment it holds or is about to hold.
- *
- * Identity is the registration. The claim references are separate because they
- * answer different questions: `claim_id` is the attachment that holds the subject
- * now, `reserved_claim_id` is the exclusive entitlement waiting for a process that
- * has not presented. Neither is derived from the other, and a row shows both
- * without pretending one is the other.
+ * One execution and the attachment it holds or awaits: `claim_id` holds the
+ * subject now, `reserved_claim_id` waits for a process that has not presented.
  */
 export interface ExecutionObservation {
   bound_registration_id?: string | null;
@@ -1694,20 +1684,16 @@ export interface ExecutionObservation {
    */
   ended: boolean;
   /**
-   * Why an intended restart or continuation of this execution failed, when it
-   * did. The execution and its effects are untouched; only the intended
-   * attachment failed.
+   * Why an intended restart or continuation failed; the execution is unaffected.
    */
   failed_intent?: string | null;
   origin: ExecutionOrigin;
   /**
-   * Where this execution runs, as the daemon recorded it when it verified the
-   * pane. A pane is joined to its row by this, and only this.
+   * Where the daemon verified it runs. Occupancy is [`Pane::registration_id`], not this.
    */
   placement?: Placement | null;
   /**
-   * The identity the daemon verified for this execution's process, once it has
-   * one. A launch that has not presented has none, and its row says so.
+   * Absent until a launch presents.
    */
   process?: ProcessIdentity3 | null;
   registration_id: string;
@@ -1747,9 +1733,7 @@ export interface Pane {
   label: string | null;
   location: Location;
   /**
-   * The live registration occupying this pane, resolved once by the collector
-   * from the daemon's recorded placement. Rows read it; they do not re-derive
-   * occupancy, and an ended execution never occupies a pane.
+   * Resolved by the collector; an ended execution occupies nothing.
    */
   registration_id?: string | null;
   title: string | null;

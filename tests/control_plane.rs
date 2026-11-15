@@ -2071,7 +2071,6 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         &parent_subject.execution,
         &parent_pane,
     );
-    // The parent's subject exists once its session presented on the launch.
     let parent_subject = Attempt {
         spawn: None,
         execution: parent_subject.execution.clone(),
@@ -2097,7 +2096,6 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         &worker_subject.execution,
         &worker_pane,
     );
-    // The worker's subject exists once its session presented on the launch.
     let worker_subject = Attempt {
         spawn: worker_subject.spawn.clone(),
         execution: worker_subject.execution.clone(),
@@ -2297,7 +2295,6 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
         &parent_subject.execution,
         &parent_pane,
     );
-    // The parent's subject exists once its session presented on the launch.
     let parent_subject = Attempt {
         spawn: None,
         execution: parent_subject.execution.clone(),
@@ -2322,8 +2319,6 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
         &worker_launch.execution,
         &worker_pane,
     );
-    // The worker's subject exists once its session presented on the launch,
-    // which is the attachment the grant above made.
     let worker = claim_record(&state, &worker_claim)["subject_id"]
         .as_str()
         .expect("the worker's agent")
@@ -3611,8 +3606,6 @@ fn a_reservation_with_no_spawn_edge_is_withdrawn_when_it_never_presents() {
         1_000 + 30_000,
         |registration_id| {
             retired.push(registration_id.to_string());
-            // The cleanup is what makes the withdrawal durable: a pass that says
-            // the pane is dealt with records that, and only then is it settled.
             agent_radar::control_plane::lifecycle::record_pane_cleanup(
                 &registry,
                 registration_id,
@@ -5337,7 +5330,6 @@ struct Attempt {
 }
 
 impl Attempt {
-    /// The attempt one launched execution is.
     fn of_execution(state: &Path, execution: &str, spawn: Option<&str>) -> Self {
         let registry =
             agent_radar::control_plane::Registry::open(state).expect("readable lifecycle log");
@@ -5403,7 +5395,6 @@ fn execution_id(value: &str) -> agent_radar::identity::RegistrationId {
     agent_radar::identity::RegistrationId::parse(value).expect("a registration id")
 }
 
-/// One recorded attachment, which is what a claim names.
 fn claim_record(state: &Path, claim: &str) -> Value {
     let registry =
         agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
@@ -5413,12 +5404,10 @@ fn claim_record(state: &Path, claim: &str) -> Value {
     serde_json::to_value(record).expect("a subject projection")
 }
 
-/// The code a supervisor reported for one execution.
 fn recorded_code(state: &Path, execution: &str) -> Value {
     execution_record(state, execution)["completion"]["code"].clone()
 }
 
-/// The execution a recorded claim names.
 fn execution_of_claim(state: &Path, claim: &str) -> String {
     let registry =
         agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
@@ -5430,8 +5419,6 @@ fn execution_of_claim(state: &Path, claim: &str) -> String {
         .to_string()
 }
 
-/// One recorded execution, as the daemon keeps it: the flat record a launch's
-/// state, signal, exit and pane cleanup are read from.
 fn execution_record(state: &Path, execution: &str) -> Value {
     let registry =
         agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
@@ -5519,8 +5506,6 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         child_registration_for(&state, &spawn_id, &subject.execution),
     );
     let child = registration_id(&registered);
-    // The registration attached the launch's subject, so read it before the
-    // cancel releases it.
     let subject = Attempt::of_execution(&state, &subject.execution, Some(&spawn_id));
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
@@ -5551,8 +5536,6 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         "the launch's own pane {pane} is gone: {:?}",
         pane_ids(&server)
     );
-    // A bound launch is ended by the exit its stop established, not revoked: what
-    // it reported stands, and the edge keeps naming the child it bound.
     assert_eq!(
         execution_record(&state, &subject.execution)["state"],
         "bound"
@@ -5563,8 +5546,6 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         json!(child),
         "{spawn}"
     );
-    // Binding is the process's identity, not a subject: the launch attached no
-    // session, so there is no agent for the edge to name.
     assert_eq!(
         spawn["result"]["spawn"]["bound"]["subject_id"],
         Value::Null,
@@ -5649,8 +5630,6 @@ fn lifecycle_get_reports_a_subject_without_its_private_launch_data() {
         "{cancelled}"
     );
 
-    // A launch that never presented has no subject to read, so its public view is
-    // the spawn that made it — and that view carries none of the private launch.
     let read = client.call("spawn.get", json!({"request_id": spawn_id}));
     let view = &read["result"]["spawn"];
     assert_eq!(
@@ -5783,8 +5762,6 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
         cwd: None,
         env: BTreeMap::new(),
     };
-    // A claim exists before a process only as a successor: the incumbent is
-    // enrolled, and the launch under test reserves after it.
     let incumbent = agent_radar::control_plane::lifecycle::enroll_subject(
         &registry,
         &agent_radar::identity::ClaimId::random(),
@@ -5836,7 +5813,6 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
         "{cancelled}"
     );
     assert_eq!(closed["resource"]["state"], json!("kept"), "{cancelled}");
-    // The cancelled attempt is the reserved successor, which is an execution.
     let subject = execution_record(&state, ticket.registration_id.as_str());
     assert_eq!(subject["state"], "revoked");
     assert_eq!(subject["signalled_at"], Value::Null, "{subject}");
@@ -7141,8 +7117,6 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let record = result_record(&response);
     assert_eq!(record["method"], "spawn.create");
     assert_eq!(record["outcome"], "completed");
-    // A launch that has not presented is an execution, so its intent is read
-    // there; the subject list holds the agents that attached.
     let listed = client.call("lifecycle.list", json!({"limit": 20}));
     assert!(
         listed["result"]["subjects"]
@@ -7234,8 +7208,6 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let delivered = recorded_launch(&sandbox.state(), &launch_execution);
     assert_eq!(delivered.executable, "/usr/bin/pi");
     assert_eq!(delivered.argv, ["--child", "row one"]);
-    // The token is the execution it authorises, so a launch presents the same
-    // identity it was handed and no second one can claim it.
     assert_eq!(launch_execution, token, "a spawn token names its execution");
     assert_eq!(
         execution_record(&sandbox.state(), &launch_execution)["registration_id"],
@@ -10507,8 +10479,6 @@ fn a_reported_code_survives_the_pane_a_close_removes() {
         json!(["-c", "exec sleep 300"]),
     );
     let pane = launch_pane(&mut client, &spawn_id);
-    // The supervisor is the only source of a program's code: it reports on the
-    // execution it supervises, naming the key the launch gave it.
     let recorded = execution_record(&state, &subject.execution);
     let reported = client.call(
         "launch.complete",
@@ -12594,8 +12564,7 @@ fn a_claimless_report_recovers_the_attachment_it_already_made() {
         "location":{"backend":"tmux","pane":"wA:p1"}});
     let first = client.call("agent.presence", report.clone());
     assert_eq!(first["result"]["standing"], "granted", "{first}");
-    // The reply was lost, so the client reports again naming nothing. It gets the
-    // attachment it already has rather than a second one.
+    // The reply was lost: the retry names no claim.
     let retried = client.call("agent.presence", report);
     assert_eq!(retried["result"]["standing"], "granted", "{retried}");
     assert_eq!(
@@ -12638,8 +12607,7 @@ fn a_claimless_report_for_another_session_replaces_the_registrations_previous_at
         "location":{"backend":"tmux","pane":"wA:p1"}});
     let held = client.call("agent.presence", report.clone());
     assert_eq!(held["result"]["standing"], "granted", "{held}");
-    // A new session on the same process means the previous session's shutdown
-    // release never arrived; Radar settles it rather than strand the next session.
+    // The previous session's shutdown release never arrived.
     let mut other = report;
     other["session_id"] = json!(random_uuid());
     let replacement = client.call("agent.presence", other);
@@ -12907,8 +12875,6 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
     assert_eq!(held["result"]["standing"], "granted", "{held}");
     let subject = held["result"]["subject_id"].clone();
     let registration = held["result"]["registration_id"].clone();
-    // Session shutdown releases the attachment, and only then does the next
-    // session start: the daemon never replaces a claim behind a client's back.
     let released = client.call(
         "agent.release",
         json!({
@@ -12966,10 +12932,6 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
     )
     .expect("daemon");
     let mut client = Client::dial(daemon.path());
-    // The incumbent is gone, so the session is free: a claimless report takes it
-    // and the subject it held comes back with it. Repeating a claim Radar minted
-    // is not how an attachment is renewed — a released or duplicated one is not
-    // promoted by being named again.
     let resumed = client.call("agent.presence", stale);
     assert_eq!(resumed["result"]["standing"], "granted", "{resumed}");
     assert_eq!(resumed["result"]["subject_id"], subject, "{resumed}");
@@ -13251,8 +13213,6 @@ fn restart_refuses_before_any_signal_when_the_session_context_changes() {
     );
     assert_eq!(error_code(&malformed), "bad_params", "{malformed}");
 
-    // The same process releases this session and starts another: the restart is
-    // then refused because the lead's recorded session no longer matches.
     let current = client.call(
         "lifecycle.get",
         json!({"subject_id": subject.subject.clone().expect("a presented agent")}),
@@ -13427,7 +13387,6 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
     let pid = captured_identity(&state, &subject.execution).pid;
     assert_eq!(daemon.stop(Signal::TERM, DEADLINE).code(), Some(0));
     let mut daemon = tmux_daemon(&socket, &state, &server);
-    // The restarted daemon re-reads the same execution and signals nothing.
     let reread = execution_record(&state, &subject.execution);
     assert_eq!(
         reread["process"]["pid"],

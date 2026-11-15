@@ -71,8 +71,7 @@ pub struct RegistryRead {
     /// Durable containers, which the backend's own inventory does not carry: a
     /// fleet Radar created has a topology of its own.
     pub containers: Vec<PublicContainer>,
-    /// Every execution, attached or not, with its placement and attachment refs.
-    /// A row is one of these joined to what it holds now.
+    /// Every recorded execution, attached or not.
     pub executions: Vec<crate::model::ExecutionObservation>,
 }
 

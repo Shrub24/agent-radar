@@ -45,8 +45,6 @@ unknown = "diamond"
         }
     }
 
-    // A launch that has not presented is an execution with no attachment yet, and
-    // its row still animates because the daemon is still waiting on it.
     let mut observation = FleetObservation::default();
     let registration = agent_radar::identity::RegistrationId::random();
     observation.executions.push(ExecutionObservation {
@@ -85,8 +83,6 @@ unknown = "diamond"
         })
         .collect::<Vec<_>>()
         .join("\\n");
-    // The row names the execution it is: no subject exists yet, so it is titled by
-    // the registration the daemon issued.
     let loading = theme::frame(theme::command_frames().expect("configured frames"), 0);
     assert!(rendered.contains(&format!(
         "{loading} pending · execution {}",

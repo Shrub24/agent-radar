@@ -1037,8 +1037,7 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 			});
 			if (state !== claim) return undefined;
 			if (!answer.ok) {
-				// Radar refused the attachment this report named, so the client stops
-				// naming it: the next report is claimless and Radar resolves it.
+				// Never name a refused claim again; Radar resolves the claimless report.
 				if (answer.code === "refused" && claim.claim_id) {
 					delete claim.claim_id;
 					save();
@@ -1073,9 +1072,7 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 		report(session) {
 			const releases = [...(state?.releases ?? [])];
 			const held = state;
-			// A reload or a reconnect of the same session keeps the attachment Radar
-			// minted. A different session names none: Radar replaces the attachment
-			// this registration held when the new session presents.
+			// The same session keeps its claim; a new session names none and Radar replaces the old.
 			const resumed = held?.session === session ? held?.claim_id : undefined;
 			standing = undefined;
 			state = {
@@ -1105,8 +1102,7 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 				if (!save()) return;
 			}
 			await releasePending();
-			// The attachment ends here: its identity must not be named again, so a
-			// later report for this session asks Radar for a fresh one.
+			// A released claim must not be named again.
 			if (state === releasing && state !== undefined) delete state.claim_id;
 		},
 		stop() { stopped = true; if (timer) scheduler.clearTimeout(timer); timer = undefined; },

@@ -310,8 +310,6 @@ pub(super) fn observe_launch_panes(
         let Some(registration_id) = edge.registration_id.clone() else {
             continue;
         };
-        // A pane observation is about the subject the execution carries, which a
-        // launch only has once its session attached.
         let Some(claim_id) = registry::presence::current(registry, &registration_id)
             .ok()
             .flatten()
@@ -455,9 +453,7 @@ pub(super) fn wake_request(
     };
     // The wake names the attempt it was armed for, under its wire field name.
     let registration_id = &params.registration_id;
-    // The wake names the execution, which exists from its reservation whether or
-    // not a session has attached a subject. A launch that never presented still
-    // has a pane whose death must be observed.
+    // By execution: a launch that never presented still has a pane to observe.
     let execution = match crate::control_plane::lifecycle::read_process(&registry, registration_id)
     {
         Ok(Some(execution)) => execution,

@@ -409,7 +409,6 @@ fn attachment_views_share_process_evidence_across_replay() {
         let before_signal = log
             .facts(ticket.claim_id.as_ref().expect("a claim"))
             .unwrap();
-        // Process evidence belongs to the execution's own stream.
         log.append(
             Stream::Process(&ticket.registration_id),
             "2026-01-01T00:00:02.000Z",
@@ -657,8 +656,6 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
         process.subject_id.is_none() && process.claim_id.is_none(),
         "a process registration is not a claim or subject"
     );
-    // A launch reserves an execution, not a subject: a lifecycle pointer names
-    // this launch's subject when it has one, and names none when it has not.
     assert!(
         pointers
             .iter()

@@ -437,3 +437,37 @@ A subject's grant, its exclusive reservation, its most recently granted claim an
 **Rejected alternative:** key every row by registration. Rejected: a restart reuses the pane and creates a new registration, so a registration-keyed row changes identity at each restart.
 
 **Revisit when:** occupancy needs the serving instance — the collector would compare each placement's instance with the server now serving, once its per-refresh cost is measured. Until then destructive effects stay fenced by their own instance checks.
+
+## An execution ends by its exit; a completion is how it ended
+
+**Id:** f68da1f8-0c49-48c3-b23e-b8900ba2cee9
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** quality review of the unified-execution-lifecycle branch, accepted by the maintainer ("yep fix all"), 2026-11-14
+**Verification:** corroborated — `supervisor_completion_ends_the_execution_and_releases_its_claim`; the full suite and lifecycle acceptance pass with the single predicate
+
+An execution has ended on a verified exit or a confirmed external end, answered by one `ended()` on the execution facts and record. A supervisor's completion records the exit with it, so a completion is never checked on its own.
+
+**Reason:** five readers each defined "ended", and they disagreed about whether a completion alone counts. They agreed only because completion already records the exit, which made the extra checks dead and left a gap a future writer could open.
+
+**Rejected alternative:** count a recorded completion as an end. Rejected: a completion that did not also record the exit would be a settlement bug, and counting it would hide that bug instead of exposing it.
+
+**Revisit when:** something can legitimately record a completion without an exit.
+
+## A confirmed subject control is frozen by its claim alone
+
+**Id:** e124d36d-0ae2-46f6-99ac-84aeea208336
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer ruling on per-surface targeting ("internally the process surface should entirely use registration ids", higher surfaces resolve through the claim); removal accepted with the review findings
+**Verification:** corroborated — `a_control_naming_a_stale_claim_signals_nothing`
+
+Cancel and stop name the claim the row showed, and the daemon acts on that claim's execution or refuses. Subject controls carry no separate registration id.
+
+**Reason:** a claim belongs to exactly one registration, so the claim already pins the execution; a second id was never sent by any production caller and only duplicated the claim's answer.
+
+**Rejected alternative:** freeze the registration as well. Rejected: two identities that must agree is hand-synchronised state with nothing to gain.
+
+**Revisit when:** a control addresses an execution that holds no claim, such as an unplaced launch that never presented.

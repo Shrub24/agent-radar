@@ -440,7 +440,7 @@
       "type": "object"
     },
     "ExecutionObservation": {
-      "description": "One execution: a process incarnation and what it is doing, joined to the\nattachment it holds or is about to hold.\n\nIdentity is the registration. The claim references are separate because they\nanswer different questions: `claim_id` is the attachment that holds the subject\nnow, `reserved_claim_id` is the exclusive entitlement waiting for a process that\nhas not presented. Neither is derived from the other, and a row shows both\nwithout pretending one is the other.",
+      "description": "One execution and the attachment it holds or awaits: `claim_id` holds the\nsubject now, `reserved_claim_id` waits for a process that has not presented.",
       "properties": {
         "bound_registration_id": {
           "type": [
@@ -460,7 +460,7 @@
           "type": "boolean"
         },
         "failed_intent": {
-          "description": "Why an intended restart or continuation of this execution failed, when it\ndid. The execution and its effects are untouched; only the intended\nattachment failed.",
+          "description": "Why an intended restart or continuation failed; the execution is unaffected.",
           "type": [
             "string",
             "null"
@@ -478,7 +478,7 @@
               "type": "null"
             }
           ],
-          "description": "Where this execution runs, as the daemon recorded it when it verified the\npane. A pane is joined to its row by this, and only this."
+          "description": "Where the daemon verified it runs. Occupancy is [`Pane::registration_id`], not this."
         },
         "process": {
           "anyOf": [
@@ -489,7 +489,7 @@
               "type": "null"
             }
           ],
-          "description": "The identity the daemon verified for this execution's process, once it has\none. A launch that has not presented has none, and its row says so."
+          "description": "Absent until a launch presents."
         },
         "registration_id": {
           "type": "string"
@@ -618,7 +618,7 @@
           "type": "array"
         },
         "executions": {
-          "description": "Every execution this daemon records, whether or not a session has attached\nit yet. A row is one execution joined to its optional attachment, so a\nlaunch in flight is published here before it presents.",
+          "description": "Every recorded execution, attached or not.",
           "items": {
             "$ref": "#/$defs/ExecutionObservation"
           },
@@ -1472,7 +1472,7 @@
           "$ref": "#/$defs/Location"
         },
         "registration_id": {
-          "description": "The live registration occupying this pane, resolved once by the collector\nfrom the daemon's recorded placement. Rows read it; they do not re-derive\noccupancy, and an ended execution never occupies a pane.",
+          "description": "Resolved by the collector; an ended execution occupies nothing.",
           "type": [
             "string",
             "null"

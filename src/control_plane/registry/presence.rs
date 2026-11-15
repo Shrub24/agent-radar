@@ -1,11 +1,4 @@
-//! Claims: the one durable record of an attachment.
-//!
-//! A claim is a proposed or established attachment of a registration to a subject.
-//! Its standing is a recorded transition on the claim's own lifecycle stream, so
-//! ordering, replay and a subject's current, reserved and previous grant all come
-//! from one authority. Nothing here keeps a second copy of that authority: a
-//! subject record holds its durable identity and metadata, and the claim says
-//! which execution is attached to it.
+//! Claims: the durable record of an attachment, and its only authority.
 
 use super::{Registry, validate_registration_id};
 use crate::control_plane::events::AttachmentFacts;
@@ -22,9 +15,7 @@ pub struct Report {
     pub incarnation: String,
     pub process: crate::model::ProcessIdentity,
     pub session_id: String,
-    /// The claim Radar returned for this attachment, echoed back on heartbeats and
-    /// reconnects. A first report names none: Radar resolves its own reservation or
-    /// mints the claim, so the client never owns an attachment identity.
+    /// The claim Radar returned, echoed on heartbeats and reconnects. A first report names none.
     #[serde(default)]
     pub claim_id: Option<crate::identity::ClaimId>,
     #[serde(default)]
@@ -181,7 +172,7 @@ pub fn decision(registry: &Registry, claim_id: &ClaimId) -> Result<Option<Decisi
         .map(|facts| Decision::of(claim_id, &facts)))
 }
 
-/// The newest claim one registration made, whatever its standing.
+/// The registration's newest claim, whatever its standing.
 pub fn current(
     registry: &Registry,
     registration_id: &RegistrationId,
@@ -193,9 +184,7 @@ pub fn current(
     Ok(log.facts(&claim).map(|facts| Decision::of(&claim, &facts)))
 }
 
-/// The authority a registration holds now. A pending, reserved, duplicate or
-/// released claim is not authority, and a granted one is only authority while it
-/// is still its subject's grant.
+/// The registration's granted claim while it is still its subject's grant.
 pub fn attachment(
     registry: &Registry,
     registration_id: &RegistrationId,
@@ -217,13 +206,10 @@ pub fn attachment(
     }))
 }
 
-/// Starts or reasserts a presence attempt. Callers serialize presence decisions;
-/// nothing here takes the transition lock, so a launch reservation that already
-/// holds it cannot deadlock.
+/// Starts or resumes a presence attempt. Takes no lock: callers serialize presence decisions.
 ///
-/// A report that names its claim resumes that attachment; one that names none
-/// resolves the registration's reservation or discovers its live claim, so a lost
-/// reply costs a retried read rather than a second attachment.
+/// A named claim resumes. A claimless report fulfils the registration's reservation,
+/// returns its live claim for this session, or replaces the previous session's.
 pub fn begin(
     registry: &Registry,
     registration_id: &RegistrationId,
@@ -280,8 +266,6 @@ pub fn begin(
             return decision(registry, &existing.claim_id)?
                 .ok_or_else(|| "claim disappeared".into());
         }
-        // A new session on this registration replaces the previous attachment,
-        // whose shutdown release was not delivered.
         lifecycle::release_claim(registry, &existing.claim_id)?;
     }
     let execution = lifecycle::adopted_execution(registry, registration_id, now_ms)?;
@@ -302,8 +286,7 @@ pub fn record(registry: &Registry, decision: &Decision, now_ms: i64) -> Result<(
     lifecycle::record_claim_standing(registry, decision, now_ms)
 }
 
-/// Holds a subject for a launch that has not presented. Not authority: it excludes
-/// competing attachments until this registration presents or is withdrawn.
+/// Holds a subject for a launch that has not presented: excludes, never authorizes.
 pub fn reserve(
     registry: &Registry,
     registration_id: &RegistrationId,
@@ -331,7 +314,7 @@ pub fn reserve(
     )
 }
 
-/// Ends this claim's authority, keeping it as the record of what it was.
+/// Ends this claim's authority; the claim stays recorded.
 pub fn release(
     registry: &Registry,
     registration_id: &RegistrationId,

@@ -5,17 +5,11 @@ use super::*;
 pub(super) struct SubjectParams {
     #[serde(default)]
     pub(super) subject_id: Option<SubjectId>,
-    /// The attachment the caller saw, when it saw one. A launch that never
-    /// presented has no claim, so its execution is addressed without one.
+    /// Absent for a launch that never presented.
     #[serde(default)]
     pub(super) claim_id: Option<ClaimId>,
     #[serde(default)]
     pub(super) spawn_request_id: Option<String>,
-    /// The exact execution the caller saw, when its row was keyed by one. A row is
-    /// a registration, so this is what keeps a confirmation from acting on a
-    /// different process after the subject's attachment changed.
-    #[serde(default)]
-    pub(super) registration_id: Option<RegistrationId>,
 }
 
 /// Validates, records and dispatches a cancel or stop of a tracked launch.
@@ -795,9 +789,7 @@ pub(super) fn cancel_target(
     let internal = |error: String| Refusal::new(Code::Internal, error);
     let (execution, claim, target) = match (&params.subject_id, &params.spawn_request_id) {
         (Some(subject_id), None) => {
-            // The caller names which attachment it saw, so the execution acted on
-            // is the one that claim belongs to — a reserved successor is a
-            // legitimate target while the grant it will succeed is still current.
+            // Act on the named claim's execution; a reserved successor is a valid target.
             let subject = match params.claim_id.as_ref() {
                 Some(claim_id) => subjects::read_claim(registry, claim_id)
                     .map_err(internal)?
@@ -831,8 +823,6 @@ pub(super) fn cancel_target(
             let launched = subjects::read_process(registry, &registration_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "launch execution is not recorded"))?;
-            // A launch that never presented has no subject to name, which is the
-            // ordinary state of one that is still in flight.
             let subject = match registry::presence::current(registry, &launched.registration_id)
                 .map_err(internal)?
                 .and_then(|claim| claim.subject_id)
@@ -866,24 +856,9 @@ pub(super) fn cancel_target(
             ));
         }
     };
-    // A confirmation names the execution it was shown. If that execution is no
-    // longer the one this address resolves to, the row the operator agreed to act
-    // on is not the row that would be acted on, so nothing is dispatched.
-    if let Some(seen) = &params.registration_id
-        && seen != &execution
-    {
-        return Err(Refusal::new(
-            Code::Refused,
-            "the execution the caller saw is no longer the one recorded; nothing was signalled",
-        ));
-    }
-    // An attached subject is only acted on for the claim the caller saw, so a
-    // stale release cannot revoke a newer grant. An execution with no attachment
-    // has no claim to name, which is the ordinary state of a launch in flight.
+    // Only the claim the caller saw, so a stale release cannot revoke a newer grant.
     match (params.claim_id.as_ref(), claim.as_ref()) {
         (Some(requested), Some(claim)) => {
-            // A granted or reserved claim is what a caller may act on: a reserved
-            // successor is named before it presents, and a stale release cannot act.
             let granted = subjects::granted_claim(registry, &claim.subject_id).map_err(internal)?;
             let reserved =
                 subjects::reserved_claim(registry, &claim.subject_id).map_err(internal)?;
@@ -897,9 +872,7 @@ pub(super) fn cancel_target(
                 ));
             }
         }
-        // Naming a subject names its attachment: the caller says which claim it
-        // saw, so a stale release cannot act on a newer grant. Only a launch
-        // addressed by its spawn may omit the claim, because it may not have one.
+        // Only a spawn-addressed launch may omit the claim.
         (None, Some(_)) => {
             return Err(Refusal::new(
                 Code::BadParams,
@@ -933,8 +906,6 @@ pub(super) fn termination_outcome(
     completion: Option<subjects::Completion>,
 ) -> Settlement {
     let closed = subjects::ClosedExecution {
-        // The execution that was addressed, whether or not it ever attached a
-        // subject: a launch cancelled in flight still ended.
         executions: execution
             .map(|execution| {
                 vec![subjects::EndedExecution {

@@ -146,7 +146,7 @@ pub struct AgentIdentity {
 pub struct PaneIdentity {
     pub pane_id: String,
     pub occupant: Option<AgentIdentity>,
-    /// The registration the observation named as this pane's occupant.
+    /// The occupant the observation named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_id: Option<crate::identity::RegistrationId>,
 }
@@ -171,7 +171,6 @@ pub enum TargetIdentity {
 }
 
 impl TargetIdentity {
-    /// Every pane this identity froze.
     pub fn panes_mut(&mut self) -> Vec<&mut PaneIdentity> {
         match self {
             Self::Pane(pane) => vec![pane],

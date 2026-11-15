@@ -241,13 +241,7 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
     }
 }
 
-/// Every execution this daemon records, joined to the attachment it holds or is
-/// about to hold.
-///
-/// Read from the execution records themselves, so an execution that has not been
-/// attached — a launch in flight, a recipe launch with no spawn edge — is
-/// published too. The attachment references are resolved from the claim records:
-/// a grant and a reservation are separate questions with separate answers.
+/// Every recorded execution, including ones not yet attached or launched without a spawn edge.
 fn executions(registry: &Registry) -> Result<Vec<crate::model::ExecutionObservation>, String> {
     use crate::control_plane::events::Standing;
     let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());

@@ -160,8 +160,7 @@ pub(crate) fn selection(kind: &RowKind, represents_tab: Option<&str>) -> Selecte
             Selected::Refused("a workspace is not a close target: close a pane or its tab")
         }
         RowKind::Task(_) => Selected::Refused("a background task is not a close target"),
-        // A launch that has not presented has no agent row, but its pane is the
-        // place the operator sees; closing it is the ordinary fenced pane close.
+        // A launch that has not presented closes through its pane, fenced like any pane close.
         RowKind::Lifecycle(lifecycle) => match &lifecycle.pane_id {
             Some(pane_id) => Selected::Pane {
                 pane_id: pane_id.clone(),

@@ -31,8 +31,7 @@ pub enum Action {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Subject {
     pub subject_id: crate::identity::SubjectId,
-    /// The attachment the row showed. A claim belongs to exactly one execution, so
-    /// it already freezes which process a confirmed control may affect.
+    /// The attachment the row showed; it names exactly one execution.
     pub claim_id: crate::identity::ClaimId,
 }
 
