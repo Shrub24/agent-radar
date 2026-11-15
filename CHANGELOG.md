@@ -31,6 +31,8 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 - **Breaking:** a registration identifies one process incarnation whether or not its launch is bound. Fencing a bound launch with a different process identity is refused instead of accepted.
 - Wire revision 18 (now 19; see the presence entry above), paired with pi-radar 0.16.0. The wire revision moved because the spawn binding and the subject row carry the execution id. Earlier launch records are refused at startup; `radar reset` clears them.
 
+## Radar 0.11.0
+
 - **Breaking (library):** APIs distinguish subject, claim and registration IDs with validated types; their JSON representation and schemas remain strings.
 - The paired client release is pi-radar 0.15.0, requiring exactly daemon wire revision 17.
 - Event pointers no longer identify an unattached process as a subject. Assignment publication events name the subject they describe, while process publication events name the registration; neither is published under the other identity kind.
