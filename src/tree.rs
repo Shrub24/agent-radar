@@ -129,7 +129,9 @@ impl TaskProjection {
 )]
 pub enum RowId {
     Workspace(String),
-    /// Agent row, keyed by its connector-scoped pane id.
+    /// A pane that holds a registration: a joined agent, or a live execution the
+    /// pane names as its occupant before it presents. Keyed by the connector-scoped
+    /// pane id, so the row keeps its identity as its occupant presents or restarts.
     Agent(String),
     /// An unresolved registration's row, keyed by its agent id: it has no pane
     /// to key by, and two registrations may name the same reported pane.
@@ -138,9 +140,9 @@ pub enum RowId {
     Pane(String),
     /// Background-task row, keyed by owner, session and task id.
     Task(TaskId),
-    /// A daemon execution not represented by a joined agent row: an attached one
-    /// with no agent facts yet, or one in flight with no attachment at all. Keyed
-    /// by the registration, which identifies the process incarnation.
+    /// An execution no pane names as its occupant: unplaced, ended, or placed in a
+    /// pane another registration occupies. Keyed by the registration, which
+    /// identifies the process incarnation.
     Lifecycle(crate::identity::RegistrationId),
 }
 

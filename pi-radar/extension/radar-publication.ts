@@ -1036,11 +1036,17 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 				...(claim.subject_id ? { subject_id: claim.subject_id } : {}),
 			});
 			if (state !== claim) return undefined;
-			claim.claim_id = answer.ok ? answer.value.claim_id : claim.claim_id;
 			if (!answer.ok) {
+				// Radar refused the attachment this report named, so the client stops
+				// naming it: the next report is claimless and Radar resolves it.
+				if (answer.code === "refused" && claim.claim_id) {
+					delete claim.claim_id;
+					save();
+				}
 				if (!["absent", "timeout", "transport"].includes(answer.code)) diagnostic = answer.message;
 				return undefined;
 			}
+			claim.claim_id = answer.value.claim_id;
 			claim.registration_id = answer.value.registration_id;
 			claim.subject_id = answer.value.standing === "granted" ? answer.value.subject_id ?? undefined : undefined;
 			if (claim.subject_id !== undefined) input.granted?.(claim.subject_id);
@@ -1068,17 +1074,9 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 			const releases = [...(state?.releases ?? [])];
 			const held = state;
 			// A reload or a reconnect of the same session keeps the attachment Radar
-			// minted; a different session releases the one this process held. An
-			// attachment Radar never answered for has no identity to release yet.
+			// minted. A different session names none: Radar replaces the attachment
+			// this registration held when the new session presents.
 			const resumed = held?.session === session ? held?.claim_id : undefined;
-			if (
-				resumed === undefined &&
-				held?.registration_id &&
-				held.claim_id &&
-				!releases.some(release => release.claim_id === held.claim_id)
-			) {
-				releases.push({ registration_id: held.registration_id, claim_id: held.claim_id });
-			}
 			standing = undefined;
 			state = {
 				version: 3,

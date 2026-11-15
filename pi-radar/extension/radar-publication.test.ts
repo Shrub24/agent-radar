@@ -808,6 +808,8 @@ test("presence retries preserve the claim, fresh session loads replace it, and s
 		mode = "duplicate";
 		publication.presence.report(SESSION_B);
 		await settle();
+		assert.equal(daemon.count("agent.release"), 0, "a new session releases nothing itself: Radar replaces the attachment");
+		assert.equal(daemon.all("agent.presence").at(-1).claim_id, undefined, "and names none");
 		const duplicateClaim = minted.at(-1)!;
 		assert.notEqual(duplicateClaim, firstClaim);
 		assert.equal((await publication.subject())?.subject_id, undefined);
@@ -819,6 +821,39 @@ test("presence retries preserve the claim, fresh session loads replace it, and s
 		const calls = daemon.count("agent.presence");
 		await advance(HEARTBEAT_MS * 2);
 		assert.equal(daemon.count("agent.presence"), calls);
+		publication.stop();
+	} finally { cleanup(); }
+});
+
+test("a claim Radar refuses is no longer named, so the next report is resolved by Radar", async () => {
+	const { root, store, cleanup } = makeRoot();
+	const registration = "00000000-0000-4000-8000-000000000124";
+	const known = new Set<string>();
+	let next = 0;
+	const daemon = fakeDaemon({
+		"agent.presence": params => {
+			if (params.claim_id && !known.has(params.claim_id)) return refused("refused", "claim is not recorded");
+			const claim = params.claim_id ?? `00000000-0000-4000-8000-${String(950 + next++).padStart(12, "0")}`;
+			known.add(claim);
+			return ok({ registration_id: registration, claim_id: claim, session_id: params.session_id,
+				standing: "granted", subject_id: SESSION_A });
+		},
+	});
+	const { scheduler, advance } = fakeScheduler();
+	try {
+		const publication = publicationFor(daemon, {
+			dataRoot: root, store, scheduler, slot: createRadarProcessSlot(),
+			location: async () => ({ state: "resolved", location: { backend: "tmux", pane: "%1" } }),
+		});
+		await settle();
+		const first = daemon.all("agent.presence").at(-1);
+		assert.equal(first.claim_id, undefined);
+		known.clear(); // the daemon's state was reset
+		await advance(HEARTBEAT_MS);
+		assert.ok(daemon.all("agent.presence").at(-1).claim_id, "the heartbeat names the claim it holds");
+		await advance(HEARTBEAT_MS);
+		assert.equal(daemon.all("agent.presence").at(-1).claim_id, undefined, "after the refusal it names none");
+		assert.equal((await publication.subject())?.subject_id, SESSION_A, "and Radar's answer attaches it again");
 		publication.stop();
 	} finally { cleanup(); }
 });

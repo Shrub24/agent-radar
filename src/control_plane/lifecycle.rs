@@ -333,6 +333,13 @@ pub struct ProcessRecord {
     pub recorded_at: String,
 }
 
+impl ProcessRecord {
+    /// Whether the execution has ended; see [`crate::control_plane::events::ProcessFacts::ended`].
+    pub fn ended(&self) -> bool {
+        self.exited_at.is_some() || self.ended_externally_at.is_some()
+    }
+}
+
 /// What a spawn needs to launch a tracked child: the subject it belongs to and
 /// the correlation its launch claim presents.
 pub struct Ticket {
@@ -1111,8 +1118,7 @@ fn read_recorded(registry: &Registry, claim_id: &ClaimId) -> Result<Claim, Strin
         .ok_or_else(|| "tracked launch subject is unavailable".to_string())
 }
 
-/// The claim a subject's authority currently rests on: its newest granted claim
-/// that has not been released.
+/// The claim a subject's authority currently rests on, if one is granted.
 pub fn granted_claim(
     registry: &Registry,
     subject_id: &SubjectId,
@@ -1147,8 +1153,8 @@ pub fn reserved_claim(
     Ok(log.reserved_claim(subject_id))
 }
 
-/// Resolve a subject's current attachment: the claim that holds it now, else the
-/// newest claim that has not ended, else its last one when it is detached.
+/// Resolve a subject's current attachment: its granted claim, else its reserved
+/// one, else the claim it was last granted when it is detached.
 ///
 /// Holding wins over recency: a reserved successor waits beside the grant that
 /// still holds the subject, so it is not the subject's attachment until the
@@ -1168,7 +1174,8 @@ pub fn current_attachment(
     }
 }
 
-/// One agent's durable identity, authority pointer and attachment history.
+/// One agent's durable identity: its metadata and the session it runs. Which claim
+/// holds it is answered by the claim log, never by this record.
 pub fn read_subject_record(
     registry: &Registry,
     subject_id: &SubjectId,
@@ -1300,7 +1307,7 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
         let Some(placement) = facts.placement.clone() else {
             return;
         };
-        if ended(facts) {
+        if facts.ended() {
             return;
         }
         // A subject is a fact of the attachment, so an execution read first
@@ -1329,19 +1336,8 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
     placements.into_values().collect()
 }
 
-/// Whether an execution has ended, on the evidence that says so. Being revoked is
-/// not one of them.
-fn ended(process: &crate::control_plane::events::ProcessFacts) -> bool {
-    process.exited_at.is_some()
-        || process.ended_externally_at.is_some()
-        || process.completion.is_some()
-}
-
 fn live(process: &ProcessRecord) -> bool {
-    !matches!(process.state, State::Revoked)
-        && process.exited_at.is_none()
-        && process.ended_externally_at.is_none()
-        && process.completion.is_none()
+    !matches!(process.state, State::Revoked) && !process.ended()
 }
 
 pub(crate) fn clear_subject_attachments(registry: &Registry) -> Result<(), String> {
@@ -1939,8 +1935,7 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
     if standing.is_none_or(|standing| standing.is_terminal()) {
         return Ok(false);
     }
-    if matches!(subject.process.state, State::Pending | State::Captured)
-        && subject.process.exited_at.is_none()
+    if matches!(subject.process.state, State::Pending | State::Captured) && !subject.process.ended()
     {
         return Ok(true);
     }
@@ -1991,8 +1986,7 @@ pub fn record_launch_session(
         if let Some(found) = page.iter().find(|subject| {
             subject.process.bound_registration_id.as_ref() == Some(registration_id)
                 && subject.process.state == State::Bound
-                && subject.process.exited_at.is_none()
-                && subject.process.ended_externally_at.is_none()
+                && !subject.process.ended()
         }) {
             if found.process.origin != Origin::Spawned
                 || registry
@@ -3274,16 +3268,13 @@ fn record_exit(registry: &Registry, process: &ProcessRecord, now_ms: i64) -> Res
     record_exit_locked(registry, &mut current, now_ms)
 }
 
-/// The claims an execution still holds, in recorded order.
-fn live_claims_of(registry: &Registry, registration_id: &RegistrationId) -> Vec<ClaimId> {
-    registry
-        .events
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .claims_of_registration(registration_id)
-        .filter(|(_, facts)| !facts.standing.is_terminal())
-        .map(|(claim, _)| claim)
-        .collect()
+/// The claim an execution still holds, if any.
+fn live_claim_of(registry: &Registry, registration_id: &RegistrationId) -> Option<ClaimId> {
+    let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    log.claim_of_registration(registration_id).filter(|claim| {
+        log.facts(claim)
+            .is_some_and(|facts| !facts.standing.is_terminal())
+    })
 }
 
 fn record_exit_locked(
@@ -3304,7 +3295,7 @@ fn record_exit_locked(
     }
     // An execution that has ended holds nothing: the claims it held end with it,
     // whichever observer established the exit.
-    for claim in live_claims_of(registry, &execution.registration_id) {
+    if let Some(claim) = live_claim_of(registry, &execution.registration_id) {
         release_claim(registry, &claim)?;
     }
     Ok(())

@@ -196,8 +196,8 @@ pub fn observe_pane(
     let Some(subject) = super::read_process(registry, registration_id)? else {
         return Ok(false);
     };
-    if terminal(&subject) || subject.bound_registration_id.is_none() {
-        return Ok(terminal(&subject));
+    if subject.ended() || subject.bound_registration_id.is_none() {
+        return Ok(subject.ended());
     }
     let at = crate::control_plane::store::format_millis(now_ms);
     // Physical evidence is gathered outside the shared transition lock, so an
@@ -209,7 +209,7 @@ pub fn observe_pane(
     let Some(mut current) = super::read_process(registry, registration_id)? else {
         return Ok(false);
     };
-    if terminal(&current) {
+    if current.ended() {
         return Ok(true);
     }
     if current.bound_registration_id.is_none() {
@@ -264,10 +264,6 @@ pub fn observe_pane(
             Ok(false)
         }
     }
-}
-
-fn terminal(execution: &super::ProcessRecord) -> bool {
-    execution.exited_at.is_some() || execution.ended_externally_at.is_some()
 }
 
 /// Whether the window has elapsed with enough fresh confirmations. An unreadable

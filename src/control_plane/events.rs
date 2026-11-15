@@ -190,6 +190,12 @@ impl From<&ProcessRecord> for ProcessFacts {
 }
 
 impl ProcessFacts {
+    /// Whether the execution has ended: a verified exit or a confirmed external end.
+    /// A supervisor's completion reports how it ended, and records the exit with it.
+    pub fn ended(&self) -> bool {
+        self.exited_at.is_some() || self.ended_externally_at.is_some()
+    }
+
     pub fn apply_to(&self, process: &mut ProcessRecord) {
         process.state = self.state;
         process.identity = self.process.clone();
@@ -369,11 +375,11 @@ pub struct Log {
     directory: PathBuf,
     next_seq: u64,
     facts: BTreeMap<ClaimId, AttachmentFacts>,
-    /// The sequence that last changed each claim, so "current", "reserved" and
-    /// "previous grant" are read in recorded order rather than guessed from ids.
-    claim_seq: BTreeMap<ClaimId, u64>,
     subjects: BTreeMap<SubjectId, SubjectAttachments>,
     registrations: BTreeMap<RegistrationId, ClaimId>,
+    /// The intended attachment a registration failed, kept after the claim that
+    /// recorded it is superseded by the registration's ordinary attachment.
+    failures: BTreeMap<RegistrationId, String>,
     processes: BTreeMap<RegistrationId, ProcessFacts>,
     operations: BTreeMap<String, RequestRecord>,
     containers: BTreeMap<String, Container>,
@@ -414,9 +420,9 @@ impl Log {
             directory: directory.to_owned(),
             next_seq: 1,
             facts: BTreeMap::new(),
-            claim_seq: BTreeMap::new(),
             subjects: BTreeMap::new(),
             registrations: BTreeMap::new(),
+            failures: BTreeMap::new(),
             processes: BTreeMap::new(),
             operations: BTreeMap::new(),
             containers: BTreeMap::new(),
@@ -524,53 +530,15 @@ impl Log {
         self.facts.keys()
     }
 
-    /// Every claim on one subject, newest change first.
-    pub fn claims_of_subject<'a>(
-        &'a self,
-        subject_id: &'a SubjectId,
-    ) -> impl Iterator<Item = (ClaimId, &'a AttachmentFacts)> + 'a {
-        let mut matched: Vec<(u64, ClaimId)> = self
-            .facts
-            .iter()
-            .filter(|(_, facts)| facts.subject_id.as_ref() == Some(subject_id))
-            .map(|(claim, _)| {
-                (
-                    self.claim_seq.get(claim).copied().unwrap_or(0),
-                    claim.clone(),
-                )
-            })
-            .collect();
-        matched.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
-        matched
-            .into_iter()
-            .filter_map(move |(_, claim)| self.facts.get(&claim).map(|facts| (claim, facts)))
-    }
-
-    /// Every claim one registration made, newest change first.
-    pub fn claims_of_registration<'a>(
-        &'a self,
-        registration_id: &'a RegistrationId,
-    ) -> impl Iterator<Item = (ClaimId, &'a AttachmentFacts)> + 'a {
-        let mut matched: Vec<(u64, ClaimId)> = self
-            .facts
-            .iter()
-            .filter(|(_, facts)| &facts.registration_id == registration_id)
-            .map(|(claim, _)| {
-                (
-                    self.claim_seq.get(claim).copied().unwrap_or(0),
-                    claim.clone(),
-                )
-            })
-            .collect();
-        matched.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
-        matched
-            .into_iter()
-            .filter_map(move |(_, claim)| self.facts.get(&claim).map(|facts| (claim, facts)))
-    }
-
-    /// The newest claim for one registration, whatever its standing.
+    /// The registration's attachment: its live claim, else its newest one. At most
+    /// one claim of a registration is live, so a terminal answer means none is.
     pub fn claim_of_registration(&self, registration_id: &RegistrationId) -> Option<ClaimId> {
         self.registrations.get(registration_id).cloned()
+    }
+
+    /// The intended attachment this registration failed, if any.
+    pub fn failure_of(&self, registration_id: &RegistrationId) -> Option<&str> {
+        self.failures.get(registration_id).map(String::as_str)
     }
 
     pub fn granted_claim(&self, subject: &SubjectId) -> Option<ClaimId> {
@@ -642,6 +610,10 @@ impl Log {
             } else if next.standing.reserves_attachment() {
                 claims.reserved = Some(id.clone());
             }
+        }
+        if let Some(failure) = &next.failure {
+            self.failures
+                .insert(next.registration_id.clone(), failure.clone());
         }
         let current = self.registrations.get(&next.registration_id);
         if !next.standing.is_terminal()
@@ -863,7 +835,6 @@ impl Log {
                     if let Stream::Claim(claim) = stream {
                         self.index_attachment(claim, &attachment);
                         self.facts.insert(claim.clone(), *attachment);
-                        self.claim_seq.insert(claim.clone(), event.seq);
                     }
                 }
                 Recorded::Execution(execution) => {
@@ -894,9 +865,7 @@ fn reduce_attachment(
         (_, Some(facts)) => facts.clone(),
         _ => return Err("lifecycle transition has no baseline".into()),
     };
-    let ended = execution.is_none_or(|execution| {
-        execution.exited_at.is_some() || execution.ended_externally_at.is_some()
-    });
+    let ended = execution.is_none_or(ProcessFacts::ended);
     match &event.transition {
         Transition::SessionRecorded { session } if facts.session.is_none() && !ended => {
             facts.session = Some(session.clone())
@@ -979,21 +948,14 @@ fn reduce_process(previous: Option<&ProcessFacts>, event: &Event) -> Result<Proc
         // Placement is where an execution runs, so it is recorded while it is
         // there and never for one that has ended.
         Transition::Placed(placement)
-            if !matches!(facts.state, State::Revoked)
-                && facts.exited_at.is_none()
-                && facts.ended_externally_at.is_none()
-                && facts.completion.is_none() =>
+            if !matches!(facts.state, State::Revoked) && !facts.ended() =>
         {
             facts.placement = Some(placement.clone())
         }
-        Transition::AbsencePending(absence)
-            if facts.exited_at.is_none() && facts.ended_externally_at.is_none() =>
-        {
+        Transition::AbsencePending(absence) if !facts.ended() => {
             facts.pane_absence = absence.clone();
         }
-        Transition::EndedExternally(evidence)
-            if facts.exited_at.is_none() && facts.ended_externally_at.is_none() =>
-        {
+        Transition::EndedExternally(evidence) if !facts.ended() => {
             facts.ended_externally_at = Some(event.at.clone());
             facts.ended_evidence = Some(evidence.clone());
             // The confirmed absence is the reason, so no window is left pending.

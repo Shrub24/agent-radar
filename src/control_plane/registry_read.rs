@@ -256,9 +256,7 @@ fn executions(registry: &Registry) -> Result<Vec<crate::model::ExecutionObservat
         let attachment = log
             .claim_of_registration(registration_id)
             .and_then(|claim| log.facts(&claim).map(|facts| (claim, facts)));
-        let failed = log
-            .claims_of_registration(registration_id)
-            .find_map(|(_, facts)| facts.failure.clone());
+        let failed = log.failure_of(registration_id).map(str::to_owned);
         published.push(crate::model::ExecutionObservation {
             registration_id: registration_id.clone(),
             state: execution.state,
@@ -289,9 +287,7 @@ fn executions(registry: &Registry) -> Result<Vec<crate::model::ExecutionObservat
             bound_registration_id: execution.bound_registration_id.clone(),
             failed_intent: failed,
             session: attachment.and_then(|(_, facts)| facts.session),
-            ended: execution.exited_at.is_some()
-                || execution.ended_externally_at.is_some()
-                || execution.completion.is_some(),
+            ended: execution.ended(),
         });
     }
     Ok(published)

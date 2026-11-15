@@ -39,22 +39,21 @@ pub(crate) fn read(
     let process = &claim.process;
     result.scoped = Some(process.scope.is_some());
     let standing = presence::decision(registry, &claim.claim_id)?;
-    result.state =
-        if !current || process.exited_at.is_some() || process.ended_externally_at.is_some() {
-            AttachmentState::Detached
-        } else {
-            match standing.as_ref().map(|decision| &decision.standing) {
-                Some(presence::Standing::Reserved) => AttachmentState::Starting,
-                Some(presence::Standing::Granted) => match verify(process.identity.clone()) {
-                    ProcessVerification::Verified => AttachmentState::Live,
-                    ProcessVerification::Absent | ProcessVerification::Mismatched => {
-                        AttachmentState::Detached
-                    }
-                    ProcessVerification::Unavailable => AttachmentState::Unknown,
-                },
-                _ => AttachmentState::Unknown,
-            }
-        };
+    result.state = if !current || process.ended() {
+        AttachmentState::Detached
+    } else {
+        match standing.as_ref().map(|decision| &decision.standing) {
+            Some(presence::Standing::Reserved) => AttachmentState::Starting,
+            Some(presence::Standing::Granted) => match verify(process.identity.clone()) {
+                ProcessVerification::Verified => AttachmentState::Live,
+                ProcessVerification::Absent | ProcessVerification::Mismatched => {
+                    AttachmentState::Detached
+                }
+                ProcessVerification::Unavailable => AttachmentState::Unknown,
+            },
+            _ => AttachmentState::Unknown,
+        }
+    };
     if current {
         let registration = registry.get(&process.registration_id)?;
         if result.state == AttachmentState::Live {

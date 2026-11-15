@@ -128,9 +128,7 @@ fn occupants_current(registry: &Registry, request: &CloseRequest) -> bool {
             .ok()
             .flatten()
             .is_some_and(|execution| {
-                execution.exited_at.is_none()
-                    && execution.ended_externally_at.is_none()
-                    && execution.completion.is_none()
+                !execution.ended()
                     && execution
                         .placement
                         .as_ref()
