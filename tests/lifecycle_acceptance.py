@@ -118,6 +118,16 @@ class Acceptance:
             sequence = 0
             while True:
                 sequence += 1
+                switch = root / f"switch-{{os.getpid()}}"
+                if switch.exists():
+                    # Pi's /resume or /new: the same process presents another session.
+                    switch.unlink()
+                    report["session_id"] = str(uuid.uuid4())
+                    del report["claim_id"]
+                    granted = call(root / "control.sock", "agent.presence", report)
+                    assert granted["standing"] == "granted", granted
+                    report["claim_id"] = granted["claim_id"]
+                    (root / f"agent-{{os.getpid()}}.json").write_text(json.dumps({{"report": report, "granted": granted}}))
                 call(root / "control.sock", "agent.presence", report)
                 call(root / "control.sock", "agent.publish", {{"registration_id": report["registration_id"],
                      "channel": "execution", "writer_handle": writer["handle"], "sequence": sequence,
@@ -353,6 +363,21 @@ def main():
         eventually(lambda: pane not in accept.tmux("list-panes", "-a", "-F", "#{pane_id}").splitlines(),
                    "UI D did not remove the selected agent's pane")
         print("lifecycle acceptance: configured L, subject-preserving UI restart and UI D passed", flush=True)
+
+        before = accept.agents()
+        accept.keys("L")
+        launched = eventually(lambda: next((agent for agent in accept.agents() if agent not in before), None),
+                              "a second configured L never produced a granted managed execution")
+        pid = launched["report"]["process"]["pid"]
+        (accept.root / f"switch-{pid}").write_text("")
+        switched = eventually(
+            lambda: next((agent for agent in accept.agents()
+                          if agent["report"]["process"]["pid"] == pid
+                          and agent["report"]["session_id"] != launched["report"]["session_id"]), None),
+            "a new session on a configured L launch was never granted")
+        assert switched["granted"]["subject_id"] != launched["granted"]["subject_id"], switched
+        assert switched["report"]["claim_id"] != launched["report"]["claim_id"], switched
+        print("lifecycle acceptance: session switch on a configured L launch passed", flush=True)
 
         created = accept.run_agent(second, ["sleep", "300"])
         registration = created["registration_id"]

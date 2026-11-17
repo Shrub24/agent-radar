@@ -1932,6 +1932,7 @@ pub fn record_launch_session(
             subject.process.bound_registration_id.as_ref() == Some(registration_id)
                 && subject.process.state == State::Bound
                 && !subject.process.ended()
+                && !claim_ended(registry, &subject.claim_id)
         }) {
             if found.process.origin != Origin::Spawned
                 || registry
@@ -1974,6 +1975,17 @@ pub fn record_launch_session(
             _ => return Ok(()),
         }
     }
+}
+
+/// A released or duplicate claim composes its still-live execution: callers
+/// matching by execution must exclude it.
+fn claim_ended(registry: &Registry, claim_id: &ClaimId) -> bool {
+    registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .facts(claim_id)
+        .is_some_and(|facts| facts.standing.is_terminal())
 }
 
 /// How `registration_id` stands against `session`: the one place that decides who
@@ -5457,6 +5469,30 @@ mod tests {
             granted_claim(&registry, &subject_id).expect("authority"),
             None
         );
+    }
+
+    #[test]
+    fn a_launch_takes_a_new_session_after_releasing_the_one_it_presented() {
+        let scratch = Scratch::new("switch");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), Some(random_uuid()), 1).expect("subject");
+        capture(
+            &registry,
+            &ticket.registration_id,
+            &ticket.correlation,
+            &identity(7),
+            &started_as(&launch()),
+            random_uuid(),
+            2,
+        )
+        .expect("capture");
+        fence_registration(&registry, &ticket.registration_id, Some(&identity(7)), 3)
+            .expect("the captured identity binds");
+        release_claim(&registry, ticket.claim_id.as_ref().expect("a claim"))
+            .expect("the session ends");
+
+        record_launch_session(&registry, &ticket.registration_id, &random_uuid(), 5)
+            .expect("a released attachment does not hold the launch to its session");
     }
 
     #[test]
