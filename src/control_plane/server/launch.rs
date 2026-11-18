@@ -28,6 +28,16 @@ pub(super) fn preflight_launch(
     core: &Arc<Mutex<Core>>,
     params: &SpawnParams,
 ) -> Result<(), Refusal> {
+    let launch = LaunchRequest {
+        pane_id: "preflight".into(),
+        executable: params.executable.clone(),
+        argv: params.argv.clone(),
+        spawn_token: None,
+        cwd: params.cwd.clone(),
+        env: params.env.clone(),
+    };
+    through_login_shell(launch, &login_shell())
+        .map_err(|message| Refusal::new(Code::BadParams, message))?;
     preflight_command(
         core,
         "preflight",
@@ -36,6 +46,11 @@ pub(super) fn preflight_launch(
         params.cwd.as_deref(),
         &params.env,
     )
+}
+
+/// The login shell a spawned child starts through: the daemon's own `SHELL`.
+fn login_shell() -> String {
+    std::env::var("SHELL").unwrap_or_default()
 }
 
 /// Asks the selected backend whether it can carry one command in one pane, before
@@ -605,7 +620,7 @@ pub(super) fn spawn_child(
                 }
                 None => target,
             };
-            Some(backend.launch(&launch, &cancel))
+            Some(backend.launch(&through_login_shell(launch, &login_shell()).ok()?, &cancel))
         });
     // A launch whose scope cannot be formed at all is refused before anything runs.
     if tracking.is_some() && launched.is_none() {
@@ -776,24 +791,29 @@ fn recipe_request(recipe: &containers::Recipe, pane_id: String) -> LaunchRequest
 
 fn shell_launch(
     recipe: &containers::Recipe,
-    mut target: LaunchRequest,
+    target: LaunchRequest,
 ) -> Result<LaunchRequest, String> {
-    if let containers::Recipe::Managed { shell, .. } = recipe {
-        let command: Vec<_> = std::iter::once(target.executable.clone())
-            .chain(target.argv.iter().cloned())
-            .collect();
-        let shell = crate::topology::target_shell_recipe(
-            &command,
-            shell,
-            None,
+    match recipe {
+        containers::Recipe::Managed { shell, .. } => {
             target
                 .cwd
-                .as_deref()
-                .ok_or("a managed recipe requires a directory")?,
-        )?;
-        target.executable = shell.command().executable.clone();
-        target.argv = shell.command().argv.clone();
+                .as_ref()
+                .ok_or("a managed recipe requires a directory")?;
+            through_login_shell(target, shell)
+        }
+        containers::Recipe::Plain(_) => Ok(target),
     }
+}
+
+/// Runs `target` through the user's login shell in its directory, so the program
+/// starts in the environment that shell and direnv give that directory.
+fn through_login_shell(mut target: LaunchRequest, shell: &str) -> Result<LaunchRequest, String> {
+    let command: Vec<_> = std::iter::once(target.executable.clone())
+        .chain(target.argv.iter().cloned())
+        .collect();
+    let shell = crate::topology::target_shell_recipe(&command, shell, None, target.cwd.as_deref())?;
+    target.executable = shell.command().executable.clone();
+    target.argv = shell.command().argv.clone();
     Ok(target)
 }
 

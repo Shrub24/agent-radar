@@ -70,14 +70,14 @@ pub fn target_shell_recipe(
     command: &[String],
     shell: &str,
     path: Option<&std::ffi::OsStr>,
-    cwd: &str,
+    cwd: Option<&str>,
 ) -> Result<crate::control_plane::containers::Recipe, String> {
     use std::path::Path;
 
     let Some(program) = command.first().filter(|program| !program.trim().is_empty()) else {
         return Err("the configured launch command is empty".into());
     };
-    if !Path::new(cwd).is_absolute() {
+    if cwd.is_some_and(|cwd| !Path::new(cwd).is_absolute()) {
         return Err("the selected launch directory is not absolute".into());
     }
     let program = program.clone();
@@ -111,7 +111,7 @@ pub fn target_shell_recipe(
         crate::control_plane::lifecycle::LaunchContext {
             executable: shell,
             argv,
-            cwd: Some(cwd.to_string()),
+            cwd: cwd.map(str::to_string),
             env: Default::default(),
         },
     ))
@@ -352,7 +352,7 @@ mod launch_tests {
             ],
             "fish",
             Some(&path),
-            "/tmp/project",
+            Some("/tmp/project"),
         )
         .expect("a user fish shell");
         let recipe = recipe.command();

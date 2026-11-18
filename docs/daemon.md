@@ -54,6 +54,11 @@ durable edge to its named parent. Name both the exact parent agent UUID and
 `parent_session_id`; fresh context on that registration must match. A shared
 session UUID never selects among live registrations.
 
+A spawned child starts the way `L` does: through the login shell (the daemon's
+`SHELL`) in its directory, with direnv applied there, so it has that directory's
+environment rather than the daemon's. A daemon whose `SHELL` is not fish, bash or
+zsh refuses spawns.
+
 Spawn accepts optional absolute cwd and an environment overlay, requiring the
 `spawn.launch_context.v1` contract (`mux.create`, `mux.launch` and
 `mux.launch_context`). The adapter quotes a single launch line and refuses

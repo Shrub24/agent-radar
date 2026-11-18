@@ -3778,6 +3778,17 @@ fn edges_written(state: &Path) -> usize {
     }
 }
 
+/// The login shell a spawned child starts through: bash, so a child does not run
+/// the operator's own shell configuration.
+fn login_shell() -> String {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("bash"))
+        .find(|bash| bash.is_file())
+        .expect("bash on PATH")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn channel_snapshot(activity: &str) -> Value {
     json!({"activity":activity,"waiting_reason":"waiting-for-owner","last_outcome":{"result":"failed-tool-timeout"},"actions":["retry"]})
 }
@@ -7209,11 +7220,13 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let launches = backend.launches();
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].pane_id, "wA:p2");
-    assert_ne!(
-        launches[0].executable, "/usr/bin/pi",
-        "tracked launches start Radar's launch chain"
+    // The login shell starts Radar's launch chain, which runs the caller's command.
+    assert_eq!(
+        [&launches[0].argv[0], &launches[0].argv[2]],
+        ["-ilc", "--"],
+        "a child starts through the login shell"
     );
-    assert_eq!(&launches[0].argv[..3], ["run", "--launch", "--socket"]);
+    assert_eq!(&launches[0].argv[4..7], ["run", "--launch", "--socket"]);
     assert_eq!(launches[0].cwd.as_deref(), Some("/work dir"));
     assert_eq!(launches[0].env["SECRET"], "PRIVATE_ENV_SENTINEL_8812");
     let token = recorded_edge(&sandbox.state(), &id)["token"]
@@ -9347,6 +9360,7 @@ impl DaemonChild {
             // names an absolute program, and a backend that never execs finds
             // nothing missing.
             .env("RADAR_SYSTEMD_RUN", scope_launcher())
+            .env("SHELL", login_shell())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (key, value) in environment {

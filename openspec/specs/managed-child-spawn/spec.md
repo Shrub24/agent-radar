@@ -115,7 +115,7 @@ Spawn edges SHALL describe daemon-requested child creation and binding, not prov
 - **THEN** common close records its execution/removal outcomes while preserving its original edge and binding and leaving assignment settlement to its owner
 
 ### Requirement: Spawn preserves explicit launch context
-A spawn SHALL accept an optional absolute working directory and an environment overlay of UTF-8 name/value pairs. Supplied values SHALL reach the child unchanged; omitted fields SHALL retain existing behavior. Overlay values SHALL override inherited values. The daemon SHALL supply its own spawn token and refuse caller attempts to set that reserved variable.
+A spawn SHALL accept an optional absolute working directory and an environment overlay of UTF-8 name/value pairs. Overlay values SHALL override inherited values and reach the child's login shell unchanged. The daemon SHALL supply its own spawn token and refuse caller attempts to set that reserved variable.
 
 #### Scenario: Herdsman child launch context
 - **WHEN** a spawn supplies a cwd and mailbox, owner, run and role environment values
@@ -123,11 +123,22 @@ A spawn SHALL accept an optional absolute working directory and an environment o
 
 #### Scenario: Old request omits launch context
 - **WHEN** a compatible spawn request omits cwd and environment
-- **THEN** launch retains the existing inherited environment and placement-derived cwd behavior
+- **THEN** the login shell starts in the placement-derived directory with the environment it gives that directory
 
 #### Scenario: Reserved registration id override
 - **WHEN** a caller supplies PI_RADAR_REGISTRATION_ID in its environment overlay
 - **THEN** admission refuses without accepting the request or creating a pane
+
+### Requirement: A child starts through the login shell
+A spawned child SHALL start through the daemon user's login shell (`SHELL`: fish, bash or zsh) in its directory, which applies direnv there before running the command, so the child has the environment that directory gives a login shell, not the daemon's.
+
+#### Scenario: Directory environment
+- **WHEN** a spawn names a directory with a direnv environment
+- **THEN** the child runs with that environment and the spawn's overlay
+
+#### Scenario: Unsupported login shell
+- **WHEN** the daemon's `SHELL` is unset or is not fish, bash or zsh
+- **THEN** the spawn is refused before any pane is created
 
 ### Requirement: Launch context is representable before creation
 The daemon SHALL validate launch-context shape, bounds and selected-backend representability before accepting a spawn or creating a pane. Unsupported cwd or environment transport SHALL refuse explicitly, never silently drop supplied fields. The adapter SHALL refuse newline or terminal-control values that its single-line launch transport cannot represent.
