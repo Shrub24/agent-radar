@@ -272,6 +272,8 @@ export type RadarProcessSlot = {
 	incarnation?: string;
 	launchRegistrationId?: string;
 	publications: Map<string, RadarPublication>;
+	/** The process's one client: presence records the registration on it. */
+	client?: RadarClient;
 };
 
 export function createRadarProcessSlot(): RadarProcessSlot {

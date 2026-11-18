@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createRadarClient } from "./radar-client.ts";
+import { createRadarClient, type RadarClient } from "./radar-client.ts";
 import { createRadarChildren } from "./radar-children.ts";
 import { createRadarMailboxPort } from "./radar-communication.ts";
 import {
@@ -8,6 +8,7 @@ import {
 	type RadarExecutionEventApi,
 } from "./radar-execution.ts";
 import { resolveRadarProcessLocation } from "./radar-location.ts";
+import { radarProcessSlot, type RadarProcessSlot } from "./radar-publication.ts";
 import {
 	lazyRadarRuntime,
 	provideRadarRuntime,
@@ -20,12 +21,24 @@ type PiRadarHost = RadarExecutionEventApi & {
 };
 
 /**
+ * The process's one client. A reload registers this extension again, and its
+ * runtime must use the client the process's presence reported through, which
+ * is the one that knows the process's registration.
+ */
+export function radarProcessClient(
+	slot: RadarProcessSlot = radarProcessSlot(),
+	create: () => RadarClient = createRadarClient,
+): RadarClient {
+	return (slot.client ??= create());
+}
+
+/**
  * Register pi-radar as the one baseline registrar for this Pi process.
  * Herdsman integrations request the same session-scoped runtime handle over
  * `pi.events`; they add orchestration data without creating another publisher.
  */
 export default function registerPiRadar(pi: PiRadarHost): void {
-	const client = createRadarClient();
+	const client = radarProcessClient();
 	const execution = createRadarExecutionAdapter(pi, {
 		client,
 		dataRoot: join(homedir(), ".pi", "agent", "pi-radar"),

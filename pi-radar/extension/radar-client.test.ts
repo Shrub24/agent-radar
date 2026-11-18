@@ -11,6 +11,8 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { radarProcessClient } from "./baseline.ts";
+import { createRadarProcessSlot } from "./radar-publication.ts";
 import { RADAR_MAX_LINE_BYTES, RADAR_WIRE_REVISION, createRadarClient, type RadarClient, type RadarClientOptions, type RadarSocket, untrustedControlSocket, watchRadarEvents } from "./radar-client.ts";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
@@ -1346,6 +1348,40 @@ test("presence and exact release use the flat claim contract and require a relea
 		assert.deepEqual(fixture.requests.map(({ method }) => method), [
 			"daemon.ping", "agent.presence", "agent.release",
 		]);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("a reloaded baseline reuses the client that reported the process's presence", async () => {
+	const fixture = makeFixture((request) => {
+		switch (request.method) {
+			case "daemon.ping":
+				return reply(request, { protocol: 2, revision: 1, contracts: ["registry.v1"] });
+			case "agent.presence":
+				return reply(request, {
+					registration_id: UUID_A, claim_id: UUID_B,
+					standing: "granted", subject_id: UUID_A,
+				});
+			case "subject.children":
+				return reply(request, { subjects: [], next: null });
+			default:
+				return reply(request, {});
+		}
+	});
+	try {
+		await listen(fixture);
+		const slot = createRadarProcessSlot();
+		const first = radarProcessClient(slot, () => fixture.client());
+		await first.presence({
+			source: "herdsman-pi", incarnation: UUID_B,
+			process: { boot_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", pid: 42, start_ticks: 99 },
+			session_id: UUID_A,
+		});
+		const reloaded = radarProcessClient(slot, () => fixture.client());
+		const children = await reloaded.subjectChildren();
+		assert.equal(children.ok, true, JSON.stringify(children));
+		assert.equal(fixture.requests.at(-1).params.registration_id, UUID_A);
 	} finally {
 		cleanup(fixture);
 	}

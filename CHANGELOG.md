@@ -2,6 +2,10 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## pi-radar 0.16.1
+
+- A Pi process keeps one Radar client across extension reloads. A session switch or `/reload` loaded the baseline again with a new client while the process's presence kept reporting through the first one, so the new client never learned the process's registration: a lead could not delegate after `/resume`, `/new` or `/reload` ("this process has no Radar registration"). Same wire revision (20), so Radar 0.12.3 pairs with it unchanged.
+
 ## Radar 0.12.3
 
 - A spawned child (`spawn.create`, and the continue and restart that reuse it) now starts through the daemon user's login shell in its directory with direnv applied, as `L` does, so it has that directory's environment instead of the daemon service's. A daemon whose `SHELL` is not fish, bash or zsh refuses spawns before creating a pane.
