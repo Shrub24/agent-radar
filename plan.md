@@ -557,6 +557,43 @@ contracts, not a reason to move assignment or result authority into Radar.
 - Inherited requirement-length warnings were resolved; keep all-spec strict
   validation warning-free as new requirements land.
 
+### Test and gate audit (planned)
+
+The suite has grown past the code it tests and the gate is slow. Audit it once,
+as one pass, against `testing-discipline`: keep tests of behaviour this project
+owns at its contracts, delete the rest.
+
+Measured at 0.12.3:
+
+- Rust tests are ~55k lines (~27.6k inline `#[cfg(test)]`, ~27.3k in `tests/`)
+  against ~50k lines of production code: 969 tests. `tests/control_plane.rs`
+  alone is 14.3k lines and 179 tests with 618 inline `json!` fixtures; the
+  inline modules of `control_plane/lifecycle.rs` and `ui.rs` are 5.7k and 5.4k.
+  pi-radar has 4.8k lines of tests (195) against 12.5k of extension code.
+- Running the suite is cheap (~21 s locally; lib unit tests 13.9 s,
+  `control_plane` 5 s). The gate's wall time is compilation: Clippy over every
+  target, a debug test build, then `nix flake check`, which builds the release
+  package with `doCheck = true` and so compiles and runs the whole suite a
+  second time in the sandbox.
+- 495 assertions check message text with `.contains("…")` and 116 compare
+  message, error or reason fields. Rendered UI text may be the contract;
+  refusal wording is not.
+
+To decide in the audit:
+
+- Whether the Nix check runs the suite at all (`doCheck = false`, or a small
+  smoke check), since the gate already runs it.
+- Which message-text assertions become typed outcome checks, and which go.
+- One fixture builder for control-plane requests instead of inline `json!`.
+- Tests that restate a dependency (serde, tmux, std) or the implementation's
+  steps rather than an owned outcome; acceptance stages the control-plane
+  tests already cover.
+- Moving `lifecycle.rs` tests out of the module, as part of the pruning.
+- The gate's hidden dependencies: `tests/cli.rs`
+  `a_run_outside_a_pane_refuses_before_running_anything` reaches the live
+  daemon through the real `XDG_RUNTIME_DIR`, and `radar run` connects with no
+  timeout before it refuses, so a wedged daemon stalls the suite.
+
 ### Nix distribution (done)
 
 Implemented and archived as `nix-distribution`; its `verification.md` records the
