@@ -29,7 +29,6 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
         AssignmentAcquire, AssignmentPublish, AssignmentRetire,
     };
     let registry = Arc::clone(&locked(core).registry);
-    let _transition = registry.transition();
     let now = store::now_ms();
     macro_rules! child {
         ($params:expr) => {

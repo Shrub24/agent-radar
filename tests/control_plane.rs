@@ -2354,6 +2354,26 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
         json!({"registration_id": root, "subject_id": worker}),
     );
     assert_eq!(error_code(&stranger), "refused", "{stranger}");
+    let acquired = client.call(
+        "subject.assignment.acquire",
+        json!({"registration_id": parent_agent, "subject_id": worker,
+               "publisher": {"source": "herdsman", "incarnation": PARENT_INCARNATION}}),
+    );
+    let handle = acquired["result"]["writer"]["handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{acquired}"))
+        .to_owned();
+    let published = client.call(
+        "subject.assignment.publish",
+        json!({"registration_id": parent_agent, "subject_id": worker,
+               "update": {"writer_handle": handle, "sequence": 1, "snapshot": {"activity": "idle"}}}),
+    );
+    assert!(published["result"].is_object(), "{published}");
+    let retired = client.call(
+        "subject.assignment.retire",
+        json!({"registration_id": parent_agent, "subject_id": worker, "writer_handle": handle}),
+    );
+    assert!(retired["result"].is_object(), "{retired}");
     let close = |client: &mut Client, caller: &str| {
         // Closing verifies the pane's occupant inside the daemon's budget. A
         // loaded machine can outrun that budget, which is a machine answer rather

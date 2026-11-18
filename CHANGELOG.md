@@ -2,6 +2,10 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Radar 0.12.2
+
+- A parent's `subject.assignment.acquire`, `publish` and `retire` no longer hang the daemon. The handler held the transition lock and called a registry write that takes it again, so the first assignment a parent sent its child blocked forever and every later request queued behind it.
+
 ## Radar 0.12.1
 
 - A launch with no spawn edge (`L`, a container recipe) can take a new session: after Pi's `/resume` or `/new` released the session it presented, its next presence was refused with "the reported session does not match the continued subject", so the session never gained a subject and Herdsman refused to delegate from it.
