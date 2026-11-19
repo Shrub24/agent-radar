@@ -12946,10 +12946,19 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
     );
     assert_eq!(taken["result"]["subject_id"], subject, "{taken}");
     let stale = report(&duplicate, &random_uuid(), TRACKED_SESSION, "wA:p2");
-    assert_eq!(
-        client.call("agent.presence", stale.clone())["result"]["standing"],
-        "duplicate"
-    );
+    let waiting = client.call("agent.presence", stale.clone());
+    assert_eq!(waiting["result"]["standing"], "duplicate", "{waiting}");
+    // While it waits, a duplicate reports on its one claim, named or not.
+    let mut named = stale.clone();
+    named["claim_id"] = waiting["result"]["claim_id"].clone();
+    for again in [stale.clone(), named] {
+        let again = client.call("agent.presence", again);
+        assert_eq!(again["result"]["standing"], "duplicate", "{again}");
+        assert_eq!(
+            again["result"]["claim_id"], waiting["result"]["claim_id"],
+            "{again}"
+        );
+    }
 
     // The incumbent exits and the daemon restarts: the duplicate's loaded state
     // is still stale, so repeating its claim never promotes it.
@@ -12972,6 +12981,56 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
     daemon.stop();
     duplicate.kill();
     switcher.kill();
+}
+
+/// A launch no spawn requested is woken by its pane's death like a spawned one:
+/// its exit is recorded and its wake removed.
+#[test]
+fn a_launch_no_spawn_requested_is_woken_by_its_pane_death() {
+    let Some(server) = TmuxServer::start("tmux-recipe-wake") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-recipe-wake");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let created = client.call(
+        "topology.create",
+        json!({
+            "request": {"kind": "tab", "workspace_id": format!("tmux:{}:$0", server.name), "focus": false},
+            "recipe": {"managed": {
+                "command": {"executable": "/bin/sh", "argv": ["-c", "exit 0"], "cwd": "/tmp", "env": {}},
+                "shell": login_shell(),
+            }},
+            "requester": "test",
+        }),
+    );
+    assert_eq!(result_record(&created)["outcome"], "completed", "{created}");
+    let registration = (0..500)
+        .find_map(|_| {
+            let registry = agent_radar::control_plane::Registry::open(&state).ok()?;
+            let placed = agent_radar::control_plane::lifecycle::placements(&registry);
+            placed
+                .first()
+                .map(|placed| placed.registration_id.to_string())
+                .or_else(|| {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                })
+        })
+        .expect("the launch is placed");
+    // The login shell starts the launch, so it is given longer than a direct one.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while execution_record(&state, &registration)["exited_at"].is_null() {
+        assert!(
+            Instant::now() < deadline,
+            "the launch's exit was never recorded"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    await_hook_removed(&server, &registration);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
 fn restart_lead_subject_with_id(client: &mut Client, request_id: &str, attempt: &Attempt) -> Value {

@@ -737,7 +737,11 @@ fn execution_row(
     inventory: &crate::model::FleetObservation,
     occupied: Option<&str>,
 ) -> TreeRow {
-    let state = lifecycle_state_label(execution.state);
+    let state = if execution.ended {
+        "ended"
+    } else {
+        lifecycle_state_label(execution.state)
+    };
     let who = execution
         .subject_id
         .as_ref()
@@ -2218,6 +2222,13 @@ mod tests {
         execution.failed_intent = Some("the intended session did not present".into());
         let row = execution_row(&execution, &FleetObservation::default(), None);
         assert!(row.title().contains("intent failed"), "{}", row.title());
+    }
+
+    #[test]
+    fn an_ended_execution_row_reads_ended_not_unresolved() {
+        let execution = execution_at("00000000-0000-4000-8000-0000000000ca", "wA:p1", true);
+        let row = execution_row(&execution, &FleetObservation::default(), None);
+        assert!(row.title().starts_with("ended"), "{}", row.title());
     }
 
     #[test]

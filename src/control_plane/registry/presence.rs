@@ -228,10 +228,15 @@ pub fn begin(
         {
             return Err("claim ID already identifies a different process or session".into());
         }
-        if existing.standing.is_terminal() {
+        if still_duplicate(registry, registration_id, &existing, session_id, now_ms)? {
+            return Ok(existing);
+        }
+        if existing.standing == Standing::Released {
             return Err("a released claim cannot be reopened".into());
         }
-        return Ok(existing);
+        if existing.standing != Standing::Duplicate {
+            return Ok(existing);
+        }
     }
     if let Some(reserved) = lifecycle::reservation_for(registry, registration_id)? {
         let intended = decision(registry, &reserved)?
@@ -252,7 +257,13 @@ pub fn begin(
             now_ms,
         )?;
     }
-    if let Some(existing) = current(registry, registration_id)?
+    let current = current(registry, registration_id)?;
+    if let Some(existing) = &current
+        && still_duplicate(registry, registration_id, existing, session_id, now_ms)?
+    {
+        return Ok(existing.clone());
+    }
+    if let Some(existing) = current
         && !existing.standing.is_terminal()
     {
         if existing
@@ -279,6 +290,24 @@ pub fn begin(
         now_ms,
     )?;
     decision(registry, &claim_id)?.ok_or_else(|| "the presence claim was not recorded".into())
+}
+
+/// A duplicate stays the answer while another registration still holds its
+/// session, so a waiting claimant reports on one claim instead of a new one each
+/// time.
+fn still_duplicate(
+    registry: &Registry,
+    registration_id: &RegistrationId,
+    claim: &Decision,
+    session_id: &str,
+    now_ms: i64,
+) -> Result<bool, String> {
+    Ok(claim.standing == Standing::Duplicate
+        && claim.session_id.as_deref() == Some(session_id)
+        && matches!(
+            lifecycle::attachment(registry, registration_id, session_id, now_ms)?,
+            lifecycle::Attachment::Other(_)
+        ))
 }
 
 /// Records what a caller decided about a claim it already began.

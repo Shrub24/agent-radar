@@ -1234,8 +1234,11 @@ pub fn place(
     placement.validate()?;
     let _transition = registry.transition();
     match read_process(registry, registration_id)? {
-        Some(process) if live(&process) => {}
-        Some(_) => return Err("an execution that has ended runs nowhere".into()),
+        Some(process) if !live(&process) => {
+            return Err("an execution that has ended runs nowhere".into());
+        }
+        Some(process) if process.placement.as_ref() == Some(&placement) => return Ok(()),
+        Some(_) => {}
         None => return Err("no execution is recorded for this registration".into()),
     }
     record_process_transition(
@@ -3682,7 +3685,11 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
         .process(&subject.process.registration_id)
         .cloned()
         .ok_or("the execution is not recorded")?;
-    let execution_changed = previous_execution != recorded_execution;
+    // When a fact was recorded is not itself a fact to transition.
+    let execution_changed = ProcessFacts {
+        recorded_at: previous_execution.recorded_at.clone(),
+        ..recorded_execution.clone()
+    } != previous_execution;
     if previous == target && !execution_changed {
         return Ok(());
     }

@@ -1421,6 +1421,13 @@ mod tests {
             &naming(ticket.registration_id.clone())
         ));
         subjects::place(&registry, &ticket.registration_id, placed_at("q"), 1002).unwrap();
+        let tail = registry.events.lock().unwrap().tail();
+        subjects::place(&registry, &ticket.registration_id, placed_at("q"), 1003).unwrap();
+        assert_eq!(
+            registry.events.lock().unwrap().tail(),
+            tail,
+            "an unchanged placement is not recorded again"
+        );
         assert!(
             !occupants_current(&registry, &naming(ticket.registration_id.clone())),
             "the confirmed occupant moved"

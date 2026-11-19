@@ -465,18 +465,12 @@ pub(super) fn wake_request(
         }
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    let edge = match registry.spawn_edge(&execution.spawn_request_id) {
-        Ok(Some(edge)) => edge,
-        Ok(None) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::NotFound, "spawn is not recorded"),
-            );
-        }
-        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
-    };
+    let placed_in = execution
+        .placement
+        .as_ref()
+        .and_then(|placement| placement.instance.as_ref());
     let serving = serving_identity(&backend, &verifier, &stopping, verification);
-    if edge.instance.as_ref() != Some(&params.server) || serving.as_ref() != Some(&params.server) {
+    if placed_in != Some(&params.server) || serving.as_ref() != Some(&params.server) {
         return Response::refused(
             &request.id,
             &Refusal::new(

@@ -2,6 +2,14 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Radar 0.12.4
+
+- A launch no spawn requested (`L`, a container recipe) is woken by its pane's death. The wake looked the launch up by its spawn edge, which these launches do not have, so every wake was refused with "spawn is not recorded", tmux printed `lifecycle-wake … returned 1` into the dying pane, and the wake was never removed: each ended launch left a slot that ran again on every later pane death. The wake now checks the server generation its placement recorded.
+- A duplicate session reports on one claim while another process holds the session. Each heartbeat minted a new claim that was immediately settled as a duplicate, two journal events every 30 s for as long as the duplicate ran.
+- An unchanged placement is no longer recorded again on every presence heartbeat, which wrote one event per heartbeat for every live agent.
+- Recording a session or subject on a claim no longer fails as an "unsupported lifecycle transition" when the execution's last event is older than the claim's copy of it.
+- An ended execution's row reads `ended` instead of `unresolved`.
+
 ## pi-radar 0.16.1
 
 - A Pi process keeps one Radar client across extension reloads. A session switch or `/reload` loaded the baseline again with a new client while the process's presence kept reporting through the first one, so the new client never learned the process's registration: a lead could not delegate after `/resume`, `/new` or `/reload` ("this process has no Radar registration"). Same wire revision (20), so Radar 0.12.3 pairs with it unchanged.
