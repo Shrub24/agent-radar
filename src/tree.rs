@@ -191,7 +191,7 @@ impl TreeRow {
                     .subject_id
                     .as_ref()
                     .map(|id| id.as_str()),
-                Some(lifecycle_state_label(lifecycle.execution.state)),
+                Some(phase_label(lifecycle.execution.phase)),
             ],
             _ => [None, None],
         };
@@ -275,16 +275,12 @@ pub struct LifecycleRow {
 impl LifecycleRow {
     /// Its process is recorded as ended.
     pub fn history(&self) -> bool {
-        self.execution.ended
+        self.execution.phase == crate::model::ExecutionPhase::Ended
     }
 
     /// Launched but not attached yet.
     pub fn unjoined(&self) -> bool {
         self.execution.subject_id.is_none()
-    }
-
-    pub fn state(&self) -> crate::control_plane::lifecycle::State {
-        self.execution.state
     }
 }
 
@@ -737,11 +733,7 @@ fn execution_row(
     inventory: &crate::model::FleetObservation,
     occupied: Option<&str>,
 ) -> TreeRow {
-    let state = if execution.ended {
-        "ended"
-    } else {
-        lifecycle_state_label(execution.state)
-    };
+    let state = phase_label(execution.phase);
     let who = execution
         .subject_id
         .as_ref()
@@ -784,12 +776,15 @@ fn execution_row(
     }
 }
 
-fn lifecycle_state_label(state: crate::control_plane::lifecycle::State) -> &'static str {
-    match state {
-        crate::control_plane::lifecycle::State::Pending => "pending",
-        crate::control_plane::lifecycle::State::Captured => "starting",
-        crate::control_plane::lifecycle::State::Bound => "unresolved",
-        crate::control_plane::lifecycle::State::Revoked => "revoked",
+fn phase_label(phase: crate::model::ExecutionPhase) -> &'static str {
+    use crate::model::ExecutionPhase;
+    match phase {
+        ExecutionPhase::Pending => "pending",
+        ExecutionPhase::Starting => "starting",
+        // A running execution is a row of its own only when no pane joins it.
+        ExecutionPhase::Running => "unresolved",
+        ExecutionPhase::Revoked => "revoked",
+        ExecutionPhase::Ended => "ended",
     }
 }
 
@@ -2199,7 +2194,11 @@ mod tests {
         crate::model::ExecutionObservation {
             registration_id: crate::identity::RegistrationId::parse(registration)
                 .expect("registration"),
-            state: crate::control_plane::lifecycle::State::Bound,
+            phase: if ended {
+                crate::model::ExecutionPhase::Ended
+            } else {
+                crate::model::ExecutionPhase::Running
+            },
             origin: crate::model::ExecutionOrigin::Spawned,
             placement: serde_json::from_value(serde_json::json!({
                 "location": {"backend": "tmux", "instance": "radar", "workspace": "wA", "tab": "wA:t1", "pane": pane}
@@ -2211,7 +2210,6 @@ mod tests {
             process: None,
             bound_registration_id: None,
             session: None,
-            ended,
             failed_intent: None,
         }
     }
@@ -2380,7 +2378,7 @@ mod tests {
         }
         let subjectless = crate::model::ExecutionObservation {
             registration_id: registration(0xa1),
-            state: crate::control_plane::lifecycle::State::Pending,
+            phase: crate::model::ExecutionPhase::Pending,
             origin: crate::model::ExecutionOrigin::Spawned,
             placement: None,
             subject_id: None,
@@ -2389,12 +2387,11 @@ mod tests {
             process: None,
             bound_registration_id: None,
             session: None,
-            ended: false,
             failed_intent: None,
         };
         let attached = crate::model::ExecutionObservation {
             registration_id: registration(0xa2),
-            state: crate::control_plane::lifecycle::State::Bound,
+            phase: crate::model::ExecutionPhase::Running,
             origin: crate::model::ExecutionOrigin::Spawned,
             placement: None,
             subject_id: Some(
@@ -2410,12 +2407,11 @@ mod tests {
             }),
             bound_registration_id: None,
             session: Some("session".into()),
-            ended: false,
             failed_intent: None,
         };
         let revoked = crate::model::ExecutionObservation {
             registration_id: registration(0xa3),
-            state: crate::control_plane::lifecycle::State::Revoked,
+            phase: crate::model::ExecutionPhase::Revoked,
             origin: crate::model::ExecutionOrigin::Spawned,
             placement: None,
             subject_id: None,
@@ -2424,7 +2420,6 @@ mod tests {
             process: None,
             bound_registration_id: None,
             session: None,
-            ended: false,
             failed_intent: None,
         };
         let observation = FleetObservation {

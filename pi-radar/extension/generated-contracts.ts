@@ -783,6 +783,10 @@ export type Provenance = "created" | "observed";
  */
 export type ExecutionOrigin = "spawned" | "enrolled" | "admitted";
 /**
+ * Where one execution is in its life.
+ */
+export type ExecutionPhase = "pending" | "starting" | "running" | "revoked" | "ended";
+/**
  * Where the unified operator's tmux client is looking, read with the inventory
  * so the two describe one moment.
  *
@@ -1680,14 +1684,11 @@ export interface ExecutionObservation {
   bound_registration_id?: string | null;
   claim_id?: string | null;
   /**
-   * Whether the daemon recorded this execution's process as ended.
-   */
-  ended: boolean;
-  /**
    * Why an intended restart or continuation failed; the execution is unaffected.
    */
   failed_intent?: string | null;
   origin: ExecutionOrigin;
+  phase: ExecutionPhase;
   /**
    * Where the daemon verified it runs. Occupancy is [`Pane::registration_id`], not this.
    */
@@ -1702,7 +1703,6 @@ export interface ExecutionObservation {
    * The session its attachment carries, when one is attached.
    */
   session?: string | null;
-  state: State;
   subject_id?: string | null;
 }
 /**

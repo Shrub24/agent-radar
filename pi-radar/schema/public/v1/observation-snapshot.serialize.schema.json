@@ -470,11 +470,6 @@
             "null"
           ]
         },
-        "ended": {
-          "default": false,
-          "description": "Whether the daemon recorded this execution's process as ended.",
-          "type": "boolean"
-        },
         "failed_intent": {
           "description": "Why an intended restart or continuation failed; the execution is unaffected.",
           "type": [
@@ -484,6 +479,9 @@
         },
         "origin": {
           "$ref": "#/$defs/ExecutionOrigin"
+        },
+        "phase": {
+          "$ref": "#/$defs/ExecutionPhase"
         },
         "placement": {
           "anyOf": [
@@ -523,9 +521,6 @@
             "null"
           ]
         },
-        "state": {
-          "$ref": "#/$defs/State"
-        },
         "subject_id": {
           "type": [
             "string",
@@ -535,9 +530,8 @@
       },
       "required": [
         "registration_id",
-        "state",
-        "origin",
-        "ended"
+        "phase",
+        "origin"
       ],
       "type": "object"
     },
@@ -557,6 +551,36 @@
         {
           "const": "admitted",
           "description": "A program Radar admitted in place.",
+          "type": "string"
+        }
+      ]
+    },
+    "ExecutionPhase": {
+      "description": "Where one execution is in its life.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Launched; its program is not claimed yet.",
+          "type": "string"
+        },
+        {
+          "const": "starting",
+          "description": "Its program is claimed and has not presented.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "Bound to the registration that presented.",
+          "type": "string"
+        },
+        {
+          "const": "revoked",
+          "description": "Its authority was revoked; its process is not recorded as ended.",
+          "type": "string"
+        },
+        {
+          "const": "ended",
+          "description": "Its process is recorded as ended.",
           "type": "string"
         }
       ]

@@ -471,3 +471,49 @@ Cancel and stop name the claim the row showed, and the daemon acts on that claim
 **Rejected alternative:** freeze the registration as well. Rejected: two identities that must agree is hand-synchronised state with nothing to gain.
 
 **Revisit when:** a control addresses an execution that holds no claim, such as an unplaced launch that never presented.
+
+## A launch's exit wake is its pane's own hook
+
+**Id:** f10ba066-3dad-4153-8aa5-79a79ed3b61a
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** design problems raised after the 0.12.4 live diagnosis, accepted by the maintainer ("yep per pane hook is required. agreed on all the design fixes"), 2026-11-21
+**Verification:** corroborated — `a_pane_death_wakes_the_daemon_and_keeps_the_users_hook`
+
+A launch's `pane-died` wake is set on its pane (`set-hook -p`), not appended to the server's global hook. It goes with the pane, and the next launch in that pane replaces it, so nothing removes it.
+
+**Reason:** the global hook runs every entry on any pane death, so each launch's wake ran for every other pane, and an entry whose removal failed stayed for the server's life and kept failing into dying panes.
+
+**Rejected alternative:** keep the global entries and fix their removal. Rejected: removal stays best effort, and every pane death would still run every live launch's wake.
+
+**Consequence:** a pane hook replaces the global one for that pane, so a user's global `pane-died` hook does not run for a launch's pane.
+
+## Callers append the transition they mean
+
+**Id:** 7813e544-d46d-4642-8169-07a49a08b0a9
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** design problems raised after the 0.12.4 live diagnosis, accepted by the maintainer ("yep per pane hook is required. agreed on all the design fixes"), 2026-11-21
+**Verification:** corroborated — the full suite and lifecycle acceptance pass with no record diffing
+
+Each lifecycle write appends the claim or execution transition it performs. No writer compares a stored record with a new one to infer what changed.
+
+**Reason:** inference turned any field that differed without being a fact change into a failed "unsupported lifecycle transition" or a recorded event that never happened; a timestamp alone did this in 0.12.4.
+
+**Rejected alternative:** exclude more fields from the comparison. Rejected: every new field would have to be judged against it again.
+
+## An execution is published with one phase
+
+**Id:** 476148f0-f567-420b-a8cb-4cb2a5fb2b45
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** design problems raised after the 0.12.4 live diagnosis, accepted by the maintainer ("yep per pane hook is required. agreed on all the design fixes"), 2026-11-21
+**Verification:** corroborated — `an_ended_execution_row_reads_ended_not_unresolved`
+
+The published execution carries one `phase` (`pending`, `starting`, `running`, `revoked`, `ended`) in place of its binding state and a separate `ended`.
+
+**Reason:** each reader combined the two, and one that read the state alone showed an ended execution as unresolved.
+

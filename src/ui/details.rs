@@ -780,8 +780,8 @@ pub(super) fn overview_lines(
                     .unwrap_or_else(|| "not attached".to_string()),
             ));
             page.push(field(
-                "state",
-                format!("{:?}", execution.state).to_lowercase(),
+                "phase",
+                format!("{:?}", execution.phase).to_lowercase(),
             ));
             page.push(field(
                 "attachment",

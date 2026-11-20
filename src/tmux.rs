@@ -534,14 +534,16 @@ impl RuntimeProvider for TmuxRuntime {
         text.trim().parse::<i32>().ok().filter(|pid| *pid > 0)
     }
 
-    /// Appends the wake to the global `pane-died` slots, so a user's own hook in
-    /// an earlier slot is left alone.
+    /// Sets the wake as the pane's own `pane-died` hook. It goes with the pane and
+    /// is replaced by the next launch in it. A pane hook runs instead of a global
+    /// one, so a user's global `pane-died` hook does not run for a launch's pane.
     fn install_exit_wake(
         &self,
-        _registration_id: &str,
+        pane_id: &str,
         command: &str,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
+        let pane = self.address(pane_id, Kind::Pane)?;
         // tmux reads the hook as its own command line and the shell reads the
         // command inside it; any character that would end or re-quote either is
         // refused rather than escaped.
@@ -552,32 +554,11 @@ impl RuntimeProvider for TmuxRuntime {
             return Err("the wake command contains characters tmux would reinterpret".into());
         }
         let hook = format!("run-shell -b \"{command}\"");
-        self.run(&["set-hook", "-ga", PANE_DIED_HOOK, &hook], cancel)
-            .map(|_| ())
-    }
-
-    /// Unsets only the slots whose command names this execution. tmux indices are
-    /// stable across an unset, so the slot read is the slot removed.
-    fn remove_exit_wake(&self, registration_id: &str, cancel: &AtomicBool) -> Result<(), String> {
-        let listing = self.run_whole(&["show-hooks", "-g", PANE_DIED_HOOK], cancel)?;
-        let marker = format!("--execution {registration_id} ");
-        for line in listing.lines() {
-            let Some(rest) = line.strip_prefix(PANE_DIED_HOOK) else {
-                continue;
-            };
-            let Some(index) = rest
-                .strip_prefix('[')
-                .and_then(|rest| rest.split_once(']'))
-                .map(|(index, _)| index)
-            else {
-                continue;
-            };
-            if line.contains(&marker) {
-                let slot = format!("{PANE_DIED_HOOK}[{index}]");
-                self.run(&["set-hook", "-gu", &slot], cancel)?;
-            }
-        }
-        Ok(())
+        self.run(
+            &["set-hook", "-p", "-t", &pane, PANE_DIED_HOOK, &hook],
+            cancel,
+        )
+        .map(|_| ())
     }
 }
 

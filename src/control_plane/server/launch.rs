@@ -1008,10 +1008,7 @@ pub(super) fn claim_request(
                 argv: execution.launch.argv.clone(),
             }),
         ),
-        Err(error) => {
-            retire_wake(&backend, registration_id, &stopping);
-            Response::refused(&request.id, &Refusal::new(Code::Refused, error))
-        }
+        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Refused, error)),
     }
 }
 
@@ -1274,6 +1271,9 @@ pub(super) fn install_exit_wake(
         .instance
         .as_ref()
         .ok_or("the launch's server generation is unrecorded, so its exit cannot be notified")?;
+    let pane = placement
+        .pane()
+        .ok_or("the launch's pane is unrecorded, so its exit cannot be notified")?;
     let command = subjects::wake_command(&bootstrap, registration_id, instance)?;
-    backend.install_exit_wake(registration_id.as_str(), &command, stopping)
+    backend.install_exit_wake(pane, &command, stopping)
 }

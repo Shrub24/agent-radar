@@ -1,8 +1,7 @@
 use agent_radar::{
     app::App,
     config::Config,
-    control_plane::lifecycle::State as LifecycleState,
-    model::{AgentState, ExecutionObservation, ExecutionOrigin, FleetObservation},
+    model::{AgentState, ExecutionObservation, ExecutionOrigin, ExecutionPhase, FleetObservation},
     observation::ObservationState,
     theme, ui,
 };
@@ -49,7 +48,7 @@ unknown = "diamond"
     let registration = agent_radar::identity::RegistrationId::random();
     observation.executions.push(ExecutionObservation {
         registration_id: registration.clone(),
-        state: LifecycleState::Pending,
+        phase: ExecutionPhase::Pending,
         origin: ExecutionOrigin::Spawned,
         placement: None,
         subject_id: None,
@@ -58,7 +57,6 @@ unknown = "diamond"
         process: None,
         bound_registration_id: None,
         session: None,
-        ended: false,
         failed_intent: None,
     });
     let mut state = ObservationState::new();

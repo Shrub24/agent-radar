@@ -48,6 +48,16 @@ test("children are listed and observed by subject, including a retained one", as
 	assert.equal((await unreadable.children.observe(subject)).kind, "unknown");
 });
 
+test("a subject Radar does not record is unrecorded, and a failed read stays unknown", async () => {
+	const refusing = (code: string) =>
+		createRadarChildren(
+			{ childGet: async () => ({ ok: false as const, code, message: "no" }) } as never,
+			{} as never,
+		);
+	assert.equal((await refusing("not_found").observe(subject)).kind, "unrecorded");
+	assert.equal((await refusing("refused").observe(subject)).kind, "unknown");
+});
+
 test("an assignment is published for the subject Radar resolves, never for a child process", async () => {
 	const h = harness([child("live")]);
 	const assignment = h.children.assignment(subject, "owner");

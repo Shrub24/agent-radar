@@ -172,7 +172,9 @@ impl Contract {
 /// Bumped 4 to 5 when lifecycle reads republished the agent as `subject_id` and
 /// the attempt as `claim_id`, and stopped publishing a generation. A revision-4
 /// client reads those names with the old meanings, so it must not connect.
-pub const PROTOCOL_REVISION: u32 = 20;
+/// Bumped 20 to 21 when an execution was published with one `phase` in place of
+/// its `state` and `ended`.
+pub const PROTOCOL_REVISION: u32 = 21;
 
 /// What the handshake advertises: the daemon contracts the backend's primitive set
 /// can serve, which is the list an external consumer pins. The backend's own

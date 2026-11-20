@@ -2,13 +2,22 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
-## Radar 0.12.4
+## Radar 0.13.0 (wire 21)
 
+- A launch's exit wake is its pane's own `pane-died` hook instead of an entry in the server's global hook. Every launch's wake ran on every pane death, and an entry whose removal failed stayed until the tmux server restarted. A user's global `pane-died` hook no longer runs for a launch's pane.
+- A published execution carries one `phase` (`pending`, `starting`, `running`, `revoked`, `ended`) in place of `state` and `ended`. Wire revision 21.
+- Lifecycle writes append the transition they perform instead of inferring it by comparing records.
+- `radar run` outside a tmux pane refuses before it connects to the daemon.
 - A launch no spawn requested (`L`, a container recipe) is woken by its pane's death. The wake looked the launch up by its spawn edge, which these launches do not have, so every wake was refused with "spawn is not recorded", tmux printed `lifecycle-wake … returned 1` into the dying pane, and the wake was never removed: each ended launch left a slot that ran again on every later pane death. The wake now checks the server generation its placement recorded.
 - A duplicate session reports on one claim while another process holds the session. Each heartbeat minted a new claim that was immediately settled as a duplicate, two journal events every 30 s for as long as the duplicate ran.
 - An unchanged placement is no longer recorded again on every presence heartbeat, which wrote one event per heartbeat for every live agent.
 - Recording a session or subject on a claim no longer fails as an "unsupported lifecycle transition" when the execution's last event is older than the claim's copy of it.
 - An ended execution's row reads `ended` instead of `unresolved`.
+
+## pi-radar 0.17.0
+
+- Requires wire revision 21.
+- A child Radar does not record is observed as `unrecorded`, separate from a read that failed (`unknown`).
 
 ## pi-radar 0.16.1
 

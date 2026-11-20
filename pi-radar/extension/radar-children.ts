@@ -20,6 +20,8 @@ export type RadarChildProgram = {
 export type RadarChildObservation =
 	| { kind: "live"; subject: RadarChild }
 	| { kind: "gone"; subject: RadarChild }
+	/** Radar records no such subject: nothing can be reached through it. */
+	| { kind: "unrecorded"; diagnostic: string }
 	| { kind: "unknown"; diagnostic: string };
 export type RadarChildren = {
 	list(selection?: SubjectChildrenParams["selection"]): Promise<RadarResult<RadarChild[]>>;
@@ -80,7 +82,11 @@ export function createRadarChildren(
 		},
 		async observe(subject) {
 			const read = await client.childGet(subject);
-			if (!read.ok) return { kind: "unknown", diagnostic: `${read.code}: ${read.message}` };
+			if (!read.ok)
+				return {
+					kind: read.code === "not_found" ? "unrecorded" : "unknown",
+					diagnostic: `${read.code}: ${read.message}`,
+				};
 			if (read.value.state === "live") return { kind: "live", subject: read.value };
 			if (read.value.state === "detached") return { kind: "gone", subject: read.value };
 			return { kind: "unknown", diagnostic: `child attachment is ${read.value.state}` };

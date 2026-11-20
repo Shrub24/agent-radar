@@ -876,7 +876,7 @@ mod tests {
     fn a_launch_closes_only_through_the_pane_it_occupies() {
         let execution: crate::model::ExecutionObservation = serde_json::from_value(serde_json::json!({
             "registration_id": "00000000-0000-4000-8000-0000000000d1",
-            "state": "pending", "origin": "spawned", "ended": false,
+            "phase": "pending", "origin": "spawned",
             "placement": {"location": {"backend": "tmux", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"}}
         })).unwrap();
         let row = |pane_id: Option<&str>| {

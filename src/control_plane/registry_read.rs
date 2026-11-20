@@ -253,7 +253,7 @@ fn executions(registry: &Registry) -> Result<Vec<crate::model::ExecutionObservat
         let failed = log.failure_of(registration_id).map(str::to_owned);
         published.push(crate::model::ExecutionObservation {
             registration_id: registration_id.clone(),
-            state: execution.state,
+            phase: crate::model::ExecutionPhase::of(execution.state, execution.ended()),
             origin: match execution.origin {
                 crate::control_plane::lifecycle::Origin::Spawned => {
                     crate::model::ExecutionOrigin::Spawned
@@ -281,7 +281,6 @@ fn executions(registry: &Registry) -> Result<Vec<crate::model::ExecutionObservat
             bound_registration_id: execution.bound_registration_id.clone(),
             failed_intent: failed,
             session: attachment.and_then(|(_, facts)| facts.session),
-            ended: execution.ended(),
         });
     }
     Ok(published)

@@ -10,7 +10,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::containers::PublicContainer;
-use crate::control_plane::lifecycle::State as LifecycleState;
 use crate::registry_observation::RegistryView;
 
 mod option_duration_millis {
@@ -601,12 +600,41 @@ impl AgentObservation {
     }
 }
 
+/// Where one execution is in its life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    /// Launched; its program is not claimed yet.
+    Pending,
+    /// Its program is claimed and has not presented.
+    Starting,
+    /// Bound to the registration that presented.
+    Running,
+    /// Its authority was revoked; its process is not recorded as ended.
+    Revoked,
+    /// Its process is recorded as ended.
+    Ended,
+}
+
+impl ExecutionPhase {
+    pub fn of(state: crate::control_plane::lifecycle::State, ended: bool) -> Self {
+        use crate::control_plane::lifecycle::State;
+        match state {
+            _ if ended => Self::Ended,
+            State::Pending => Self::Pending,
+            State::Captured => Self::Starting,
+            State::Bound => Self::Running,
+            State::Revoked => Self::Revoked,
+        }
+    }
+}
+
 /// One execution and the attachment it holds or awaits: `claim_id` holds the
 /// subject now, `reserved_claim_id` waits for a process that has not presented.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionObservation {
     pub registration_id: crate::identity::RegistrationId,
-    pub state: LifecycleState,
+    pub phase: ExecutionPhase,
     pub origin: ExecutionOrigin,
     /// Where the daemon verified it runs. Occupancy is [`Pane::registration_id`], not this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -625,9 +653,6 @@ pub struct ExecutionObservation {
     /// The session its attachment carries, when one is attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// Whether the daemon recorded this execution's process as ended.
-    #[serde(default)]
-    pub ended: bool,
     /// Why an intended restart or continuation failed; the execution is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_intent: Option<String>,
@@ -636,12 +661,12 @@ pub struct ExecutionObservation {
 impl ExecutionObservation {
     /// Revoked before presenting: no process, no attachment.
     pub fn is_withdrawn_launch(&self) -> bool {
-        self.state == LifecycleState::Revoked && self.process.is_none() && self.subject_id.is_none()
+        self.phase == ExecutionPhase::Revoked && self.process.is_none() && self.subject_id.is_none()
     }
 
     /// The pane it occupies, unless it ended or was withdrawn.
     pub fn occupied_pane(&self) -> Option<&str> {
-        if self.ended || self.is_withdrawn_launch() {
+        if self.phase == ExecutionPhase::Ended || self.is_withdrawn_launch() {
             return None;
         }
         self.placement.as_ref()?.pane()
@@ -1192,7 +1217,7 @@ mod tests {
     ) -> super::ExecutionObservation {
         serde_json::from_value(serde_json::json!({
             "registration_id": format!("00000000-0000-4000-8000-0000000000{registration:02x}"),
-            "state": "bound", "origin": "spawned", "ended": ended,
+            "phase": if ended { "ended" } else { "running" }, "origin": "spawned",
             "claim_id": claim.then(|| format!("00000000-0000-4000-8000-0000000001{registration:02x}")),
             "placement": {"location": {"backend": "tmux", "instance": "radar", "workspace": "w", "tab": "t", "pane": pane}}
         })).unwrap()

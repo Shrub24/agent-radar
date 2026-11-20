@@ -1398,9 +1398,8 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, ink: RowInk, marks: Marks) -> Lis
         }
         RowKind::Lifecycle(lifecycle) => {
             let moving = matches!(
-                lifecycle.execution.state,
-                crate::control_plane::lifecycle::State::Pending
-                    | crate::control_plane::lifecycle::State::Captured
+                lifecycle.execution.phase,
+                crate::model::ExecutionPhase::Pending | crate::model::ExecutionPhase::Starting
             );
             let mark = match theme::command_frames().filter(|_| moving) {
                 Some(frames) => theme::frame(frames, tick).to_string(),

@@ -5019,6 +5019,11 @@ impl TmuxServer {
             );
             thread::sleep(Duration::from_millis(50));
         }
+        // Launches run through a login shell, which must not load the developer's
+        // own shell configuration.
+        let home = std::env::temp_dir().join(format!("{}-home", server.name));
+        fs::create_dir_all(&home).expect("a sandbox home");
+        server.tmux(&["set-environment", "-g", "HOME", &home.to_string_lossy()]);
         server.tmux(&["new-session", "-d", "-s", "main", "-x", "100", "-y", "30"]);
         Some(server)
     }
@@ -5118,6 +5123,7 @@ impl Drop for TmuxServer {
         // A server that exited leaves its socket behind; only this name's own
         // file is ever removed.
         let _ = std::fs::remove_file(&self.socket);
+        let _ = fs::remove_dir_all(std::env::temp_dir().join(format!("{}-home", self.name)));
     }
 }
 
@@ -10247,19 +10253,6 @@ fn await_recorded_exit(state: &Path, subject_id: &str) {
     panic!("the launch's exit was never recorded");
 }
 
-/// Waits until no pane-died hook names the launch. The wake removes its slot
-/// after it records the exit, so the record can be readable first.
-fn await_hook_removed(server: &TmuxServer, subject_id: &str) -> String {
-    for _ in 0..500 {
-        let hooks = server.tmux(&["show-hooks", "-g", "pane-died"]);
-        if !hooks.contains(subject_id) {
-            return hooks;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("the launch's pane-died wake was never removed");
-}
-
 /// Waits until the named tmux server has exited, so a replacement can take its
 /// name.
 fn await_server_exit(name: &str) {
@@ -10629,8 +10622,8 @@ fn a_launch_whose_process_ignores_term_is_escalated_before_its_pane_is_closed() 
 }
 
 /// A pane whose process exits wakes the daemon, which records the exit without
-/// a stop. The wake leaves the operator's own pane-died hook alone and removes
-/// only its slot; a duplicate wake reads the same exit.
+/// a stop. The wake belongs to the launch's pane, so the server's global hooks
+/// are exactly the operator's; a duplicate wake reads the same exit.
 #[test]
 fn a_pane_death_wakes_the_daemon_and_keeps_the_users_hook() {
     let Some(server) = TmuxServer::start("tmux-lifecycle-wake") else {
@@ -10645,8 +10638,12 @@ fn a_pane_death_wakes_the_daemon_and_keeps_the_users_hook() {
     let (spawn_id, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", "exit 0"]));
     await_recorded_exit(&state, &subject.execution);
 
-    let hooks = await_hook_removed(&server, &subject.execution);
-    assert!(hooks.contains("display-message user-hook"), "{hooks}");
+    let hooks = server.tmux(&["show-hooks", "-g", "pane-died"]);
+    assert_eq!(
+        hooks.trim(),
+        "pane-died[0] display-message user-hook",
+        "{hooks}"
+    );
     let instance = recorded_edge(&state, &spawn_id)["instance"].clone();
     let duplicate = client.call(
         "lifecycle.wake",
@@ -12983,10 +12980,10 @@ fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() 
     switcher.kill();
 }
 
-/// A launch no spawn requested is woken by its pane's death like a spawned one:
-/// its exit is recorded and its wake removed.
+/// A launch no spawn requested is woken like a spawned one: its wake is checked
+/// against the server generation its placement recorded.
 #[test]
-fn a_launch_no_spawn_requested_is_woken_by_its_pane_death() {
+fn a_launch_no_spawn_requested_is_woken_through_its_placement() {
     let Some(server) = TmuxServer::start("tmux-recipe-wake") else {
         return;
     };
@@ -13028,7 +13025,12 @@ fn a_launch_no_spawn_requested_is_woken_by_its_pane_death() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    await_hook_removed(&server, &registration);
+    let instance = execution_record(&state, &registration)["placement"]["instance"].clone();
+    let woke = client.call(
+        "lifecycle.wake",
+        json!({"registration_id": registration, "server": instance}),
+    );
+    assert_eq!(woke["result"]["exited"], json!(true), "{woke}");
     let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }

@@ -1238,9 +1238,9 @@ impl App {
                 RowKind::Lifecycle(row) => {
                     command
                         && matches!(
-                            row.state(),
-                            crate::control_plane::lifecycle::State::Pending
-                                | crate::control_plane::lifecycle::State::Captured
+                            row.execution.phase,
+                            crate::model::ExecutionPhase::Pending
+                                | crate::model::ExecutionPhase::Starting
                         )
                 }
                 RowKind::Workspace { .. } => false,

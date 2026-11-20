@@ -1009,22 +1009,15 @@ pub trait RuntimeProvider: Send + Sync {
         None
     }
 
-    /// Installs the wake that runs `command` when a launch's pane process dies.
-    ///
-    /// The wake is an optimisation: it never proves an exit, and it is removed
-    /// by [`RuntimeProvider::remove_exit_wake`] once the exit is recorded.
+    /// Installs the wake that runs `command` when the process in `pane_id` dies.
+    /// The wake is a hint: it never proves an exit.
     fn install_exit_wake(
         &self,
-        _registration_id: &str,
+        _pane_id: &str,
         _command: &str,
         _cancel: &AtomicBool,
     ) -> Result<(), String> {
         Err("this runtime cannot notify a pane's process exit".to_string())
-    }
-
-    /// Removes only the wake installed for `subject_id`, leaving every other hook.
-    fn remove_exit_wake(&self, _registration_id: &str, _cancel: &AtomicBool) -> Result<(), String> {
-        Ok(())
     }
 
     /// The whole normalized inventory, or a user-facing diagnostic.
@@ -1155,15 +1148,11 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn install_exit_wake(
         &self,
-        registration_id: &str,
+        pane_id: &str,
         command: &str,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        (**self).install_exit_wake(registration_id, command, cancel)
-    }
-
-    fn remove_exit_wake(&self, registration_id: &str, cancel: &AtomicBool) -> Result<(), String> {
-        (**self).remove_exit_wake(registration_id, cancel)
+        (**self).install_exit_wake(pane_id, command, cancel)
     }
 
     fn primitives(&self) -> Primitives {

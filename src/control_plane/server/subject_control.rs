@@ -117,11 +117,6 @@ pub(super) fn run_subject_control(
     let completion = ended.as_ref().and_then(|ended| ended.completion.clone());
     let settlement = match termination {
         Ok(termination) => {
-            if let (subjects::Exit::Exited, Some(backend), Some(key)) =
-                (&termination.exit, &backend, &execution_key)
-            {
-                retire_wake(backend, key, &stopping);
-            }
             // The subject's own attempt is what the close addressed: a read that
             // went astray after the stop leaves the report unexecutioned rather
             // than inventing an identity.
@@ -938,14 +933,4 @@ pub(super) fn termination_outcome(
         subjects::Exit::Unresolved | subjects::Exit::Exited => Settlement::completed(Vec::new()),
     }
     .closed(closed)
-}
-
-/// Removes a launch's exit wake once its exit is recorded. Best effort: a slot
-/// left behind names a launch that has ended, and the next wake removes it.
-pub(super) fn retire_wake(
-    backend: &Arc<dyn RuntimeProvider>,
-    registration_id: &crate::identity::RegistrationId,
-    stopping: &AtomicBool,
-) {
-    let _ = backend.remove_exit_wake(registration_id.as_str(), stopping);
 }

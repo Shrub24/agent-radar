@@ -968,7 +968,7 @@ pub fn create_with_intent(
         session,
         process: execution,
     };
-    write(registry, &claim)?;
+    record_attempt(registry, &claim)?;
     crate::control_plane::registry::presence::reserve(
         registry,
         &claim.process.registration_id,
@@ -1965,11 +1965,19 @@ pub fn record_launch_session(
                 attachment(registry, registration_id, session, now_ms)?,
                 Attachment::Other(_)
             ) {
-                // The stored record is the one the transition is checked against.
                 let mut subject = read_recorded(registry, &found.claim_id)?;
                 subject.session = Some(session.to_string());
                 subject.process.recorded_at = format_millis(now_ms);
-                write(registry, &subject)?;
+                append_claim(
+                    registry,
+                    &subject.claim_id,
+                    &subject.process.recorded_at,
+                    crate::control_plane::events::Source::Registration,
+                    crate::control_plane::events::Transition::SessionRecorded {
+                        session: session.to_string(),
+                    },
+                )?;
+                note_attempt(registry, &subject)?;
             }
             return Ok(());
         }
@@ -2099,6 +2107,7 @@ pub fn enroll_subject(
     if unidentified_launch {
         subject.process.launch = launch;
     }
+    let previous_state = subject.process.state;
     subject.process.state = State::Bound;
     subject.process.correlation = None;
     subject.process.identity = Some(process.clone());
@@ -2107,7 +2116,7 @@ pub fn enroll_subject(
     if unidentified_launch {
         identify_launch(registry, &subject.process)?;
     }
-    write(registry, &subject)?;
+    record_enrollment(registry, &subject, previous_state)?;
     append_claim(
         registry,
         &subject.claim_id,
@@ -2129,7 +2138,7 @@ pub fn cancel_reservation(
     now_ms: i64,
 ) -> Result<(), String> {
     let _transition = registry.transition();
-    let mut next = read_recorded(registry, pending)?;
+    let next = read_recorded(registry, pending)?;
     if next.process.state != State::Pending || next.process.identity.is_some() {
         return Err(
             "the successor may have dispatched; its reservation cannot be withdrawn".into(),
@@ -2138,10 +2147,13 @@ pub fn cancel_reservation(
     if reserved_claim(registry, &next.subject_id)?.as_ref() != Some(pending) {
         return Err("the subject's claim changed while stopping its previous process".into());
     }
-    next.process.state = State::Revoked;
-    next.process.correlation = None;
-    next.process.recorded_at = format_millis(now_ms);
-    write(registry, &next)?;
+    record_process_transition(
+        registry,
+        &next.process.registration_id,
+        crate::control_plane::events::Source::ProcessControl,
+        crate::control_plane::events::Transition::Revoked,
+        now_ms,
+    )?;
     // The incumbent's grant was never displaced, so nothing is restored.
     release_claim(registry, pending)?;
     let _ = predecessor;
@@ -3354,8 +3366,16 @@ const SUPERVISION_ENV: &str = "RADAR_RUN_SUPERVISION";
 /// admitted launch as its child and reports how the program ended, because only
 /// a parent can learn that, and the pane's shell is not the program's parent.
 pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
+    if program.is_empty() {
+        eprintln!("radar run: no command to run");
+        return 2;
+    }
+    let Ok(pane) = std::env::var("TMUX_PANE") else {
+        eprintln!("radar run: this is not a tmux pane");
+        return 2;
+    };
     match std::env::var(SUPERVISION_ENV) {
-        Ok(key) => admit_and_enter(socket, kind, program, key),
+        Ok(key) => admit_and_enter(socket, kind, program, &pane, key),
         Err(_) => supervise(socket),
     }
 }
@@ -3431,15 +3451,13 @@ fn supervise(socket: &str) -> i32 {
 ///
 /// Returns only on failure. The program is never executed directly: the scope
 /// wrapper is what runs, so a scope that cannot be created runs nothing.
-fn admit_and_enter(socket: &str, kind: ProcessKind, program: &[String], key: String) -> i32 {
-    if program.is_empty() {
-        eprintln!("radar run: no command to run");
-        return 2;
-    }
-    let Ok(pane) = std::env::var("TMUX_PANE") else {
-        eprintln!("radar run: this is not a tmux pane");
-        return 2;
-    };
+fn admit_and_enter(
+    socket: &str,
+    kind: ProcessKind,
+    program: &[String],
+    pane: &str,
+    key: String,
+) -> i32 {
     let Some(process) = LocalProcfsVerifier
         .inspect(std::process::id() as i32)
         .ok()
@@ -3576,9 +3594,86 @@ fn exchange(socket: &Path, method: &str, params: Value) -> Result<Value, String>
     }
 }
 
-fn write(registry: &Registry, subject: &Claim) -> Result<(), String> {
-    write_attempt(registry, subject)?;
-    note_attempt(registry, subject)
+/// Records a new claim, and its execution when this is the execution's first record.
+fn record_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
+    use crate::control_plane::events::{AttachmentFacts, Source, Stream, Transition};
+    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_process(registry, &mut log, &claim.process)?;
+    if log.facts(&claim.claim_id).is_some() {
+        return Err("the claim is already recorded".into());
+    }
+    let facts = Box::new(AttachmentFacts::of(claim));
+    let (source, transition) = match claim.process.origin {
+        Origin::Spawned => (Source::Launch, Transition::Created(facts)),
+        Origin::Enrolled => (Source::Registration, Transition::Enrolled(facts)),
+        Origin::Admitted => return Err("an admitted process has no subject".into()),
+    };
+    log.append(
+        Stream::Claim(&claim.claim_id),
+        &claim.process.recorded_at,
+        source,
+        transition,
+    )?;
+    drop(log);
+    note_attempt(registry, claim)
+}
+
+/// Records an enrollment: the claim takes its subject and the execution is bound
+/// to the enrolling registration, captured first when nothing captured it.
+fn record_enrollment(registry: &Registry, claim: &Claim, previous: State) -> Result<(), String> {
+    use crate::control_plane::events::{Source, Stream, Transition};
+    let known = registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .facts(&claim.claim_id);
+    match known {
+        None => record_attempt(registry, claim)?,
+        Some(facts) => {
+            if facts.subject_id.is_none() {
+                append_claim(
+                    registry,
+                    &claim.claim_id,
+                    &claim.process.recorded_at,
+                    Source::Registration,
+                    Transition::Attached {
+                        subject_id: claim.subject_id.clone(),
+                    },
+                )?;
+            }
+            note_attempt(registry, claim)?;
+        }
+    }
+    if previous == State::Bound {
+        return Ok(());
+    }
+    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    let stream = Stream::Process(&claim.process.registration_id);
+    let at = &claim.process.recorded_at;
+    if previous != State::Captured {
+        let identity = claim
+            .process
+            .identity
+            .clone()
+            .ok_or("binding has no captured process")?;
+        log.append(
+            stream,
+            at,
+            Source::Bootstrap,
+            Transition::Captured(identity),
+        )?;
+    }
+    let registration_id = claim
+        .process
+        .bound_registration_id
+        .clone()
+        .ok_or("binding has no agent")?;
+    log.append(
+        Stream::Process(&claim.process.registration_id),
+        at,
+        Source::Registration,
+        Transition::Bound { registration_id },
+    )
 }
 
 /// Replaces the private recipe, which is otherwise written once at creation. A
@@ -3639,176 +3734,6 @@ fn ensure_process(
             facts: Box::new(crate::control_plane::events::ProcessFacts::from(process)),
         },
     )
-}
-
-fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
-    use crate::control_plane::events::{AttachmentFacts, ProcessFacts, Source, Stream, Transition};
-    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    ensure_process(registry, &mut log, &subject.process)?;
-    let recorded_execution = ProcessFacts::from(&subject.process);
-    let mut previous = match log.facts(&subject.claim_id) {
-        Some(facts) => facts,
-        None => {
-            let facts = AttachmentFacts::of(subject);
-            let (source, transition) = match subject.process.origin {
-                Origin::Spawned => (Source::Launch, Transition::Created(Box::new(facts))),
-                Origin::Enrolled => (Source::Registration, Transition::Enrolled(Box::new(facts))),
-                Origin::Admitted => return Err("an admitted process has no subject".into()),
-            };
-            return log.append(
-                Stream::Claim(&subject.claim_id),
-                &subject.process.recorded_at,
-                source,
-                transition,
-            );
-        }
-    };
-    let mut target = AttachmentFacts::of(subject);
-    // Standing changes only by its own transitions.
-    target.standing = previous.standing;
-    target.granted_at = previous.granted_at.clone();
-    // A presence attempt starts before its subject is known.
-    if previous.subject_id.is_none()
-        && let Some(subject_id) = target.subject_id.clone()
-    {
-        log.append(
-            crate::control_plane::events::Stream::Claim(&subject.claim_id),
-            &subject.process.recorded_at,
-            crate::control_plane::events::Source::Registration,
-            crate::control_plane::events::Transition::Attached { subject_id },
-        )?;
-        previous = log
-            .facts(&subject.claim_id)
-            .ok_or("the claim disappeared while recording its subject")?;
-    }
-    let previous_execution = log
-        .process(&subject.process.registration_id)
-        .cloned()
-        .ok_or("the execution is not recorded")?;
-    // When a fact was recorded is not itself a fact to transition.
-    let execution_changed = ProcessFacts {
-        recorded_at: previous_execution.recorded_at.clone(),
-        ..recorded_execution.clone()
-    } != previous_execution;
-    if previous == target && !execution_changed {
-        return Ok(());
-    }
-    if execution_changed {
-        let (source, transition) = if previous_execution.state != recorded_execution.state {
-            match recorded_execution.state {
-                State::Captured => (
-                    Source::Bootstrap,
-                    Transition::Captured(
-                        recorded_execution
-                            .process
-                            .clone()
-                            .ok_or("capture has no process")?,
-                    ),
-                ),
-                State::Bound => (
-                    Source::Registration,
-                    Transition::Bound {
-                        registration_id: recorded_execution
-                            .bound_registration_id
-                            .clone()
-                            .ok_or("binding has no agent")?,
-                    },
-                ),
-                State::Revoked => (Source::ProcessControl, Transition::Revoked),
-                State::Pending => return Err("cannot return a subject to pending".into()),
-            }
-        } else if previous_execution.observation != recorded_execution.observation {
-            (
-                Source::ProcessObservation,
-                Transition::Observed(
-                    recorded_execution
-                        .observation
-                        .clone()
-                        .ok_or("cannot remove a process observation")?,
-                ),
-            )
-        } else if previous_execution.exited_at != recorded_execution.exited_at {
-            (Source::ProcessObservation, Transition::ExitVerified)
-        } else if previous_execution.completion != recorded_execution.completion {
-            (
-                Source::Launch,
-                Transition::Completed(
-                    recorded_execution
-                        .completion
-                        .clone()
-                        .ok_or("cannot remove a completion")?,
-                ),
-            )
-        } else if previous_execution.pane_cleanup != recorded_execution.pane_cleanup {
-            (
-                Source::PaneControl,
-                Transition::PaneCleanup(
-                    recorded_execution
-                        .pane_cleanup
-                        .clone()
-                        .ok_or("cannot remove a pane cleanup outcome")?,
-                ),
-            )
-        } else if previous_execution.signalled_at != recorded_execution.signalled_at {
-            (Source::ProcessControl, Transition::SignalRequested)
-        } else if previous_execution.ended_externally_at != recorded_execution.ended_externally_at {
-            (
-                Source::ProcessObservation,
-                Transition::EndedExternally(
-                    recorded_execution
-                        .ended_evidence
-                        .clone()
-                        .ok_or("an ended-externally outcome needs its evidence")?,
-                ),
-            )
-        } else if previous_execution.pane_absence != recorded_execution.pane_absence {
-            (
-                Source::ProcessObservation,
-                Transition::AbsencePending(recorded_execution.pane_absence.clone()),
-            )
-        } else {
-            return Err("unsupported lifecycle transition".into());
-        };
-        // Enrollment verified the identity, so Captured precedes Bound.
-        if recorded_execution.state == State::Bound
-            && previous_execution.state != State::Captured
-            && previous_execution.state != State::Bound
-        {
-            let identity = recorded_execution
-                .process
-                .clone()
-                .ok_or("binding has no captured process")?;
-            log.append(
-                crate::control_plane::events::Stream::Process(&subject.process.registration_id),
-                &subject.process.recorded_at,
-                Source::Bootstrap,
-                Transition::Captured(identity),
-            )?;
-        }
-        log.append(
-            crate::control_plane::events::Stream::Process(&subject.process.registration_id),
-            &subject.process.recorded_at,
-            source,
-            transition,
-        )?;
-        return Ok(());
-    }
-    if previous.session.is_none() && target.session.is_some() {
-        let transition = Transition::SessionRecorded {
-            session: target
-                .session
-                .clone()
-                .ok_or("a recorded session is named")?,
-        };
-        return log.append_checked(
-            &subject.claim_id,
-            &subject.process.recorded_at,
-            Source::Registration,
-            transition,
-            &target,
-        );
-    }
-    Err("unsupported lifecycle transition".into())
 }
 
 fn recipe_path(registry: &Registry, subject_id: &str) -> PathBuf {

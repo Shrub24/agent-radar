@@ -486,12 +486,7 @@ pub(super) fn wake_request(
         store::now_ms(),
         subjects::Observer::TmuxHook,
     ) {
-        Ok(exited) => {
-            if exited {
-                retire_wake(&backend, registration_id, &stopping);
-            }
-            Response::ok(&request.id, json!({ "exited": exited }))
-        }
+        Ok(exited) => Response::ok(&request.id, json!({ "exited": exited })),
         Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     }
 }
