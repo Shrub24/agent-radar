@@ -798,6 +798,7 @@ fn run(sidebar: bool) -> io::Result<()> {
                     app.set_focus_message(Some(message));
                     dirty = true;
                 }
+                dirty |= app.expire_messages(Instant::now());
                 // Animation runs on the clock and only while something is working, so
                 // a quiet dashboard redraws when it changed and nothing moves on its
                 // own; a busy one redraws at the configured rate.
@@ -864,11 +865,11 @@ fn run(sidebar: bool) -> io::Result<()> {
                         dirty = true;
                     }
                     Event::Mouse(mouse) => {
-                        if let Some(action) = app.handle_mouse(mouse) {
-                            // The pointer has no mode to flip: the host state it shows is
-                            // the one the keys report.
-                            let _ =
-                                perform(action, &mut app, &config, &state, &mut sidebar_command);
+                        if let Some(action) = app.handle_mouse(mouse)
+                            && let Some(flip) =
+                                perform(action, &mut app, &config, &state, &mut sidebar_command)
+                        {
+                            flip_on_success = flip;
                         }
                         if let Some(offset) = app.take_scroll() {
                             *list.offset_mut() = offset;

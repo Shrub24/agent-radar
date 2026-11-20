@@ -2,6 +2,11 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Radar 0.13.1
+
+- A completed outcome leaves the footer after a second and a failed one after five; the outcomes panel (`!`) still shows it. Footer messages had stopped expiring, so the last outcome stayed until a key was pressed.
+- Focusing a row from the expanded sidebar dashboard (Enter or a click) also returns the window to the pane, through `unzoom_command`.
+
 ## Radar 0.13.0 (wire 21)
 
 - A launch's exit wake is its pane's own `pane-died` hook instead of an entry in the server's global hook. Every launch's wake ran on every pane death, and an entry whose removal failed stayed until the tmux server restarted. A user's global `pane-died` hook no longer runs for a launch's pane.

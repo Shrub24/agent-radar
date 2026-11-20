@@ -853,7 +853,7 @@ fn footer(app: &App, width: usize, focus: &Focus) -> Vec<Line<'static>> {
             Style::new().fg(palette.failed),
         )));
     }
-    if let Some(outcome) = app.session_outcome() {
+    if let Some(outcome) = app.footer_outcome() {
         use crate::control_plane::public_contracts::ui_session::CommandStatus;
         let (text, style) = match outcome.status {
             CommandStatus::Completed => ("completed", Style::new().fg(palette.done)),

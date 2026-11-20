@@ -49,8 +49,19 @@ use crate::model::{
 };
 use crate::tree::{ContainerRef, FleetTree, RowId, RowKind, TaskId, TaskRow, TaskSource};
 
-/// How long a focus message stays up when no key clears it first.
+/// How long a focus message, or a failed outcome, stays up when no key clears it first.
 const FOCUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
+/// How long a completed outcome stays in the footer: the tree already shows its result.
+const COMPLETED_OUTCOME_TTL: Duration = Duration::from_secs(1);
+
+/// Whether the footer shows the session's current outcome.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OutcomeLine {
+    #[default]
+    Hidden,
+    Pending,
+    Until(Instant),
+}
 
 /// The width of a row's disclosure marker in cells: `ui::fold_marker` draws it,
 /// and a leaf keeps the same two blank columns, so the hit cell is the same
@@ -505,6 +516,9 @@ pub struct App {
     /// lifecycle close — and when it was set. It clears on the next key press or
     /// after [`FOCUS_MESSAGE_TTL`].
     focus_message: Option<(String, Instant)>,
+    /// Whether, and until when, the footer shows the session's current outcome.
+    /// The outcomes panel keeps showing it after it leaves the footer.
+    outcome_line: OutcomeLine,
     /// Where the last draw put things, and how far each page is scrolled.
     layout: Geometry,
     /// Which page of the selected row the panel shows.
@@ -906,6 +920,12 @@ impl App {
         if changed_notice && let Some(note) = &mirror.state.interaction_notice {
             self.set_focus_message(Some(note.clone()));
         }
+        if changed_operation {
+            self.note_outcome(
+                mirror.state.operation.as_ref().map(|op| op.status),
+                Instant::now(),
+            );
+        }
         if changed_operation && let Some(op) = &mirror.state.operation {
             // The session publishes the effect it dispatched and its answer; this
             // view shows that one, and keeps no record of its own: the daemon
@@ -922,11 +942,9 @@ impl App {
             // A close publishes what it established, so the line says that rather
             // than only that the request settled: an exit nobody verified and a
             // pane left behind are the two things an operator has to act on.
-            let message = match op.closed().and_then(close_status::describe) {
-                Some(detail) => format!("{} · {detail}", op.status),
-                None => format!("{} · request {}", op.status, op.request_id),
-            };
-            self.set_focus_message(Some(message));
+            if let Some(detail) = op.closed().and_then(close_status::describe) {
+                self.set_focus_message(Some(format!("{} · {detail}", op.status)));
+            }
             // A focus with no client attached names the place: this view opens a
             // terminal for it and asks the session again once one is attached.
             if let Some(crate::control_plane::public_contracts::ui_session::OutcomeError {
@@ -1042,6 +1060,32 @@ impl App {
             .as_ref()
             .and_then(|link| link.mirror.as_ref())
             .and_then(|mirror| mirror.state.operation.as_ref())
+    }
+
+    /// The session's current outcome while the footer still shows it.
+    pub fn footer_outcome(
+        &self,
+    ) -> Option<&crate::control_plane::public_contracts::ui_session::CommandOutcome> {
+        self.session_outcome()
+            .filter(|_| self.outcome_line != OutcomeLine::Hidden)
+    }
+
+    /// Starts the footer's showing of a new outcome: a pending one stays until it
+    /// settles, a settled one for its time.
+    fn note_outcome(
+        &mut self,
+        status: Option<crate::control_plane::public_contracts::ui_session::CommandStatus>,
+        now: Instant,
+    ) {
+        use crate::control_plane::public_contracts::ui_session::CommandStatus;
+        self.outcome_line = match status {
+            None => OutcomeLine::Hidden,
+            Some(CommandStatus::Admitted | CommandStatus::DispatcherAccepted) => {
+                OutcomeLine::Pending
+            }
+            Some(CommandStatus::Completed) => OutcomeLine::Until(now + COMPLETED_OUTCOME_TTL),
+            Some(_) => OutcomeLine::Until(now + FOCUS_MESSAGE_TTL),
+        };
     }
 
     /// Presents the question a shared interaction asks here. The highlighted
@@ -1549,7 +1593,9 @@ impl App {
                         row: Some(row),
                     },
                 );
-                return None;
+                // Focusing from the expanded dashboard hands the window back to the
+                // pane being focused.
+                return self.expanded.then_some(Action::ToggleZoom);
             }
             CommandId::Filter => self.begin_filter_edit(),
             CommandId::NextAttention => {
@@ -1698,20 +1744,24 @@ impl App {
         self.focus_message = message.map(|message| (message, Instant::now()));
     }
 
-    /// Drops a message that has been up for [`FOCUS_MESSAGE_TTL`]. Returns
-    /// whether anything changed, so the caller can skip a redraw.
-    ///
-    /// A completed outcome ages out with it, because the result was the operator's
-    /// own action and the tree already shows it. Nothing is retained beyond it: a
-    /// longer record is the daemon's, read by the request id the line names.
-    pub fn expire_focus_message(&mut self, now: Instant) -> bool {
-        match &self.focus_message {
-            Some((_, set)) if now.duration_since(*set) >= FOCUS_MESSAGE_TTL => {
-                self.focus_message = None;
-                true
-            }
-            _ => false,
+    /// Drops a message that has been up for [`FOCUS_MESSAGE_TTL`] and a settled
+    /// outcome whose time is up. Returns whether anything changed, so the caller
+    /// can skip a redraw.
+    pub fn expire_messages(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if let Some((_, set)) = &self.focus_message
+            && now.duration_since(*set) >= FOCUS_MESSAGE_TTL
+        {
+            self.focus_message = None;
+            changed = true;
         }
+        if let OutcomeLine::Until(until) = self.outcome_line
+            && now >= until
+        {
+            self.outcome_line = OutcomeLine::Hidden;
+            changed = true;
+        }
+        changed
     }
 
     /// Reads one key of the filter editor.
@@ -2410,9 +2460,39 @@ mod tests {
     fn a_focus_message_expires_on_its_own() {
         let mut app = app_with_fixture();
         app.set_focus_message(Some("tmux refused to focus: pane_not_found".into()));
-        assert!(!app.expire_focus_message(Instant::now()));
-        assert!(app.expire_focus_message(Instant::now() + FOCUS_MESSAGE_TTL));
+        assert!(!app.expire_messages(Instant::now()));
+        assert!(app.expire_messages(Instant::now() + FOCUS_MESSAGE_TTL));
         assert_eq!(app.focus_message(), None);
+    }
+
+    #[test]
+    fn focusing_from_the_expanded_dashboard_hands_the_window_back() {
+        let mut state = ObservationState::new();
+        state.apply_success(crate::model::testing::fleet());
+        let mut app = App::sidebar();
+        app.refresh(&state);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        app.toggle_expanded();
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::ToggleZoom));
+    }
+
+    #[test]
+    fn a_settled_outcome_leaves_the_footer_and_a_pending_one_stays() {
+        use crate::control_plane::public_contracts::ui_session::CommandStatus;
+        let mut app = app_with_fixture();
+        let now = Instant::now();
+        app.note_outcome(Some(CommandStatus::Completed), now);
+        assert!(!app.expire_messages(now));
+        assert!(app.expire_messages(now + COMPLETED_OUTCOME_TTL));
+        assert_eq!(app.outcome_line, OutcomeLine::Hidden);
+
+        app.note_outcome(Some(CommandStatus::Refused), now);
+        assert!(!app.expire_messages(now + COMPLETED_OUTCOME_TTL));
+        assert!(app.expire_messages(now + FOCUS_MESSAGE_TTL));
+
+        app.note_outcome(Some(CommandStatus::Admitted), now);
+        assert!(!app.expire_messages(now + FOCUS_MESSAGE_TTL * 10));
+        assert_eq!(app.outcome_line, OutcomeLine::Pending);
     }
 
     const MANAGED_OWNER: &str = "01a10c77-8a6b-7035-8a0e-b1fa607bb507";
