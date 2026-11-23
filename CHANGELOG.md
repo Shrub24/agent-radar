@@ -2,6 +2,12 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Unreleased
+
+- Managed child launches receive their recorded parent identity so Herdsman can deliver sealed handoffs through Radar.
+- Enter and row clicks in the workspace sidebar hand keyboard focus to the agent pane after Radar confirms focus.
+- The workspace sidebar keeps a quarter of the window width, bounded to 32–60 columns, without resizing the hidden rail or expanded dashboard into a normal split.
+
 ## Radar 0.13.1
 
 - A completed outcome leaves the footer after a second and a failed one after five; the outcomes panel (`!`) still shows it. Footer messages had stopped expiring, so the last outcome stayed until a key was pressed.

@@ -260,6 +260,9 @@ pub struct SidebarConfig {
     pub show_command: Option<Vec<String>>,
     pub zoom_command: Option<Vec<String>>,
     pub unzoom_command: Option<Vec<String>>,
+    /// Hands the keyboard to the agent area once a focus from the sidebar has landed.
+    /// Set by the hosted workspace, which owns the agent pane; not read from the file.
+    pub focus_command: Option<Vec<String>>,
 }
 
 /// The loaded configuration: defaults with any file's choices applied.

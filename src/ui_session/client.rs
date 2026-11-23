@@ -110,6 +110,7 @@ struct Pending {
     action: dto::UiAction,
     gate: u64,
     incarnation: u64,
+    receipt: Option<oneshot::Sender<String>>,
     _count: PendingCount,
 }
 
@@ -196,6 +197,16 @@ impl UiClient {
 
     /// Queues an action behind every earlier one. Never blocks.
     pub fn submit(&self, action: dto::UiAction) {
+        self.enqueue(action, None);
+    }
+
+    pub fn submit_tracked(&self, action: dto::UiAction) -> oneshot::Receiver<String> {
+        let (sender, receipt) = oneshot::channel();
+        self.enqueue(action, Some(sender));
+        receipt
+    }
+
+    fn enqueue(&self, action: dto::UiAction, receipt: Option<oneshot::Sender<String>>) {
         let shown = *locked(&self.inner.shown);
         if action.is_ordinary() && self.inner.observed_gate.load(Ordering::SeqCst) != shown.gate {
             return;
@@ -205,6 +216,7 @@ impl UiClient {
             action,
             gate: shown.gate,
             incarnation: self.inner.incarnation.load(Ordering::SeqCst),
+            receipt,
             _count: PendingCount(Arc::clone(&self.inner)),
         };
         if self.outbox.try_send(pending).is_err() {
@@ -761,10 +773,21 @@ async fn action_pump(
             }
         };
         match outcome {
-            dto::ActionOutcome::Applied { update_id, .. }
-            | dto::ActionOutcome::Replayed { update_id, .. } => {
+            dto::ActionOutcome::Applied {
+                update_id,
+                request_id,
+                ..
+            }
+            | dto::ActionOutcome::Replayed {
+                update_id,
+                request_id,
+                ..
+            } => {
                 number += 1;
                 inner.floor.fetch_max(update_id, Ordering::SeqCst);
+                if let (Some(receipt), Some(request_id)) = (pending.receipt, request_id) {
+                    let _ = receipt.send(request_id);
+                }
             }
             // Not accepted, so the number was never consumed.
             dto::ActionOutcome::Busy => {
@@ -806,6 +829,7 @@ mod tests {
                     action: dto::UiAction::CycleOrder,
                     gate: 0,
                     incarnation: 0,
+                    receipt: None,
                     _count: PendingCount(Arc::clone(inner)),
                 })
                 .await

@@ -1004,6 +1004,7 @@ pub(super) fn claim_request(
             &request.id,
             Ok(Claimed {
                 registration_id: execution.registration_id.clone(),
+                parent_subject_id: execution.managed.parent_subject_id.clone(),
                 executable: execution.launch.executable.clone(),
                 argv: execution.launch.argv.clone(),
             }),

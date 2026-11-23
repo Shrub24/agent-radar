@@ -117,6 +117,12 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             "client-attached",
             "set-option -t workspace destroy-unattached on",
         ])?;
+        // The fit is also the window-resized hook, so the first fit here and every
+        // later resize of the window follow the same policy.
+        let fit = fit_sidebar("%0");
+        run(&["set-hook", "-g", "window-resized", &fit])?;
+        run(&["set-hook", "-g", "window-unzoomed", &fit])?;
+        run(&["if-shell", "-F", "1", &fit])?;
         if empty {
             run(&["resize-pane", "-Z", "-t", "%0"])?;
         } else {
@@ -171,8 +177,6 @@ fn bindings() -> [[&'static str; 4]; 4] {
             "F11",
             "select-pane -t %0 ; send-keys -t %0 Z",
         ],
-        // Returning to the agents while expanded collapses the sidebar first, so
-        // the window and the sidebar's mode change together.
         [
             "bind-key",
             "-n",
@@ -193,49 +197,86 @@ pub fn sidebar_commands() -> Option<SidebarConfig> {
     ))
 }
 
+/// The sidebar's share of the window, as a percentage, and the columns that share
+/// is kept within.
+const SIDEBAR_SHARE: u32 = 25;
+const SIDEBAR_MIN: u32 = 32;
+const SIDEBAR_MAX: u32 = 60;
+
+/// The sidebar's width policy, as a tmux command list: a quarter of the window,
+/// between the bounds. A hidden sidebar (`@radar_hidden`) stays a one-column rail,
+/// and a zoomed one is left alone. tmux's resize takes a percentage but no clamp,
+/// so each bound is a conditional command. The conditions read only the window and
+/// the flags, so one command's resize cannot change which command applies next.
+fn fit_sidebar(pane: &str) -> String {
+    let hidden = "#{&&:#{@radar_hidden},#{==:#{window_zoomed_flag},0}}";
+    let free = "#{&&:#{==:#{@radar_hidden},},#{==:#{window_zoomed_flag},0}}";
+    let quarter = format!("#{{e|/:#{{e|*:#{{window_width}},{SIDEBAR_SHARE}}},100}}");
+    format!(
+        "if-shell -F -t {pane} '{hidden}' 'resize-pane -t {pane} -x 1' ; \
+         if-shell -F -t {pane} '{free}' 'resize-pane -t {pane} -x {SIDEBAR_SHARE}%' ; \
+         if-shell -F -t {pane} '#{{&&:{free},#{{e|<:{quarter},{SIDEBAR_MIN}}}}}' 'resize-pane -t {pane} -x {SIDEBAR_MIN}' ; \
+         if-shell -F -t {pane} '#{{&&:{free},#{{e|>:{quarter},{SIDEBAR_MAX}}}}}' 'resize-pane -t {pane} -x {SIDEBAR_MAX}'"
+    )
+}
+
 fn commands(tmux: &str, host: &str, pane: &str) -> SidebarConfig {
-    let resize = |args: &[&str]| {
+    let argv = |args: &[&str]| {
         Some(
-            [
-                vec![
-                    tmux.to_string(),
-                    "-L".into(),
-                    host.into(),
-                    "resize-pane".into(),
-                    "-t".into(),
-                    pane.into(),
-                ],
-                args.iter().map(|arg| arg.to_string()).collect(),
-            ]
-            .concat(),
+            [tmux, "-L", host]
+                .into_iter()
+                .chain(args.iter().copied())
+                .map(String::from)
+                .collect(),
         )
     };
+    // tmux runs a command list only as an `if-shell` branch, so a list given as one
+    // argument goes through a condition that always holds.
+    let list = |commands: &str| argv(&["if-shell", "-F", "1", commands]);
     // Zoom and unzoom state what they want rather than toggle, so the mode and the
     // window cannot disagree after the user zooms by hand.
     let zoomed = |then: &str, otherwise: &str| {
-        Some(
-            [
-                tmux,
-                "-L",
-                host,
-                "if-shell",
-                "-F",
-                "-t",
-                pane,
-                "#{window_zoomed_flag}",
-                then,
-                otherwise,
-            ]
-            .map(String::from)
-            .to_vec(),
-        )
+        argv(&[
+            "if-shell",
+            "-F",
+            "-t",
+            pane,
+            "#{window_zoomed_flag}",
+            then,
+            otherwise,
+        ])
     };
-    let leave = format!("resize-pane -Z -t {pane}");
+    let fit = fit_sidebar(pane);
     SidebarConfig {
-        hide_command: resize(&["-x", "1"]),
-        show_command: resize(&["-x", "32"]),
-        zoom_command: zoomed("", &leave),
-        unzoom_command: zoomed(&leave, ""),
+        // The flag is what the fit reads, so a hidden sidebar is not refitted by a
+        // resize of the window and is not the sidebar's width.
+        hide_command: argv(&[
+            "resize-pane",
+            "-t",
+            pane,
+            "-x",
+            "1",
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            "@radar_hidden",
+            "1",
+        ]),
+        show_command: list(&format!("set-option -p -t {pane} -u @radar_hidden ; {fit}")),
+        zoom_command: zoomed("", &format!("resize-pane -Z -t {pane}")),
+        unzoom_command: zoomed(&format!("resize-pane -Z -t {pane} ; {fit}"), ""),
+        // Unzooms only when zoomed, so a sidebar that was only narrowed keeps its width.
+        focus_command: argv(&[
+            "if-shell",
+            "-F",
+            "-t",
+            pane,
+            "#{window_zoomed_flag}",
+            &format!("resize-pane -Z -t {pane} ; {fit} ; select-pane -t %1"),
+            "select-pane -t %1",
+        ]),
         launch_command: None,
     }
 }
@@ -405,35 +446,169 @@ mod tests {
         );
     }
 
-    #[test]
-    fn host_commands_target_the_outer_server_and_sidebar_not_the_agent_backend() {
-        let commands = commands("/bin/tmux", "radar-ui-view", "%0");
-        assert_eq!(
-            commands.hide_command.unwrap(),
-            [
-                "/bin/tmux",
-                "-L",
-                "radar-ui-view",
-                "resize-pane",
-                "-t",
-                "%0",
+    /// A disposable tmux server laid out as `launch` lays out the workspace: the
+    /// sidebar `%0` beside the agent pane `%1`, fitted and hooked. Without tmux the
+    /// test says so and passes without checking anything.
+    struct Workspace(String);
+
+    impl Workspace {
+        fn start(test: &str) -> Option<Self> {
+            if Command::new("tmux").arg("-V").output().is_err() {
+                eprintln!("skipping {test}: no tmux on PATH");
+                return None;
+            }
+            let workspace = Self(format!("radar-ws-{test}-{}", std::process::id()));
+            workspace.tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "w",
                 "-x",
-                "1"
-            ]
-        );
-        assert_eq!(commands.show_command.unwrap().last().unwrap(), "32");
-        let zoom = commands.zoom_command.unwrap();
-        let unzoom = commands.unzoom_command.unwrap();
-        assert_ne!(zoom, unzoom, "each says which state it wants");
+                "160",
+                "-y",
+                "48",
+                "sleep 600",
+            ]);
+            workspace.tmux(&["split-window", "-h", "-p", "75", "-t", "%0", "sleep 600"]);
+            let fit = fit_sidebar("%0");
+            workspace.tmux(&["set-hook", "-g", "window-resized", fit.as_str()]);
+            workspace.tmux(&["if-shell", "-F", "1", fit.as_str()]);
+            Some(workspace)
+        }
+
+        fn tmux(&self, args: &[&str]) -> String {
+            let output = Command::new("tmux")
+                .args(["-L", &self.0, "-f", "/dev/null"])
+                .args(args)
+                .env_remove("TMUX")
+                .output()
+                .expect("tmux runs");
+            assert!(
+                output.status.success(),
+                "tmux {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        fn host_commands(&self) -> SidebarConfig {
+            commands("tmux", &self.0, "%0")
+        }
+
+        /// Runs one of the host commands the sidebar would run.
+        fn run(&self, command: &Option<Vec<String>>) {
+            let command = command.as_ref().expect("the command is set");
+            let status = Command::new(&command[0])
+                .args(&command[1..])
+                .env_remove("TMUX")
+                .status()
+                .expect("the host command runs");
+            assert!(status.success(), "{command:?}");
+        }
+
+        fn width(&self, pane: &str) -> u32 {
+            self.tmux(&["display", "-p", "-t", pane, "#{pane_width}"])
+                .parse()
+                .expect("a width")
+        }
+
+        fn window(&self, format: &str) -> String {
+            self.tmux(&["display", "-p", "-t", "w", format])
+        }
+
+        fn resize_window(&self, columns: u32) {
+            let columns = columns.to_string();
+            self.tmux(&["resize-window", "-x", &columns, "-y", "48", "-t", "w"]);
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", &self.0, "kill-server"])
+                .output();
+        }
+    }
+
+    #[test]
+    fn the_sidebar_holds_a_quarter_of_the_window_between_its_bounds() {
+        let Some(workspace) = Workspace::start("quarter") else {
+            return;
+        };
+        assert_eq!(workspace.width("%0"), 40, "a quarter of the launch size");
+        for (columns, sidebar) in [(100, 32), (200, 50), (400, 60), (160, 40)] {
+            workspace.resize_window(columns);
+            assert_eq!(
+                workspace.width("%0"),
+                sidebar,
+                "a window of {columns} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hidden_sidebar_stays_a_rail_through_a_resize_and_shows_again() {
+        let Some(workspace) = Workspace::start("rail") else {
+            return;
+        };
+        let commands = workspace.host_commands();
+        workspace.run(&commands.hide_command);
+        assert_eq!(workspace.width("%0"), 1);
+        workspace.resize_window(200);
         assert_eq!(
-            zoom.last().unwrap(),
-            "resize-pane -Z -t %0",
-            "zoom acts only when not zoomed"
+            workspace.width("%0"),
+            1,
+            "a resize does not unhide the rail"
         );
+        workspace.run(&commands.show_command);
+        assert_eq!(workspace.width("%0"), 50, "show restores the policy width");
+    }
+
+    #[test]
+    fn an_expanded_sidebar_stays_expanded_through_a_resize_and_refits_when_it_returns() {
+        let Some(workspace) = Workspace::start("expand") else {
+            return;
+        };
+        let commands = workspace.host_commands();
+        workspace.run(&commands.zoom_command);
+        assert_eq!(workspace.window("#{window_zoomed_flag}"), "1");
+        workspace.resize_window(120);
         assert_eq!(
-            unzoom[unzoom.len() - 2],
-            "resize-pane -Z -t %0",
-            "unzoom acts only when zoomed"
+            workspace.window("#{window_zoomed_flag}"),
+            "1",
+            "a resize does not end the expansion"
         );
+        workspace.run(&commands.unzoom_command);
+        assert_eq!(workspace.window("#{window_zoomed_flag}"), "0");
+        assert_eq!(
+            workspace.width("%0"),
+            32,
+            "a quarter of 120 columns, held at the bound"
+        );
+    }
+
+    #[test]
+    fn a_focus_hands_the_keyboard_to_the_agent_pane_and_unzooms_an_expanded_sidebar() {
+        let Some(workspace) = Workspace::start("focus") else {
+            return;
+        };
+        let commands = workspace.host_commands();
+        let active = || workspace.window("#{pane_id}");
+        workspace.tmux(&["select-pane", "-t", "%0"]);
+        workspace.tmux(&["resize-pane", "-t", "%0", "-x", "45"]);
+        workspace.run(&commands.focus_command);
+        assert_eq!(active(), "%1");
+        assert_eq!(
+            workspace.width("%0"),
+            45,
+            "a focus does not refit a sidebar that was not expanded"
+        );
+
+        workspace.tmux(&["select-pane", "-t", "%0"]);
+        workspace.tmux(&["resize-pane", "-Z", "-t", "%0"]);
+        workspace.run(&commands.focus_command);
+        assert_eq!(active(), "%1");
+        assert_eq!(workspace.window("#{window_zoomed_flag}"), "0");
+        assert_eq!(workspace.width("%0"), 40, "unzoomed onto the policy width");
     }
 }

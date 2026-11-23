@@ -2104,6 +2104,20 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
             .map(str::to_owned),
         claim: Some(worker_claim.clone()),
     };
+    let pid = captured_identity(&state, &worker_subject.execution).pid;
+    let parent_marker = format!(
+        "PI_RADAR_MANAGED_PARENT_SUBJECT_ID={}",
+        parent_subject
+            .subject
+            .as_deref()
+            .expect("a presented parent")
+    );
+    wait_for("the worker receives its Radar-issued parent", || {
+        fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
+            env.split(|byte| *byte == 0)
+                .any(|entry| entry == parent_marker.as_bytes())
+        })
+    });
     let attached = client.call(
         "lifecycle.get",
         json!({"subject_id": worker_subject.subject.clone().expect("a presented worker")}),

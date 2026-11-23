@@ -87,6 +87,9 @@ pub enum Action {
     ToggleZoom,
     /// Open a sidebar beside this dashboard; the caller owns the host command.
     LaunchSidebar,
+    /// A focus this view asked for landed: the caller hands the keyboard to the
+    /// location it focused, and owns the host commands that do it.
+    HandOff,
 }
 
 /// Which page of the selected row's details the panel shows.
@@ -494,6 +497,9 @@ pub struct App {
         crate::control_plane::public_contracts::ui_session::UiRowId,
         crate::runtime::Target,
     )>,
+    focus_receipt: Option<tokio::sync::oneshot::Receiver<String>>,
+    focus_command_id: Option<String>,
+    focus_landed: bool,
     /// Bus data pushed by connected extensions, joined to rows when they are
     /// drawn. It sits beside the tree rather than inside it: bus facts are true
     /// only while their connection is open, so a refresh must never be able to
@@ -927,6 +933,7 @@ impl App {
             );
         }
         if changed_operation && let Some(op) = &mirror.state.operation {
+            self.settle_focus(op);
             // The session publishes the effect it dispatched and its answer; this
             // view shows that one, and keeps no record of its own: the daemon
             // already retains every request, readable by the id named here.
@@ -1029,15 +1036,50 @@ impl App {
 
     /// Asks the session to focus `row`, whatever this view's freshness.
     pub fn submit_focus_row(
-        &self,
+        &mut self,
         row: crate::control_plane::public_contracts::ui_session::UiRowId,
     ) {
-        self.submit_session(
-            crate::control_plane::public_contracts::ui_session::UiAction::RunCommand {
+        self.focus_command_id = None;
+        self.focus_receipt = self.session.as_ref().map(|link| {
+            link.client.submit_tracked(UiAction::RunCommand {
                 command: crate::control_plane::public_contracts::ui_session::SharedCommand::Focus,
                 row: Some(row),
-            },
-        );
+            })
+        });
+    }
+
+    /// Settles the focus this view asked for. Only a completed focus hands the
+    /// keyboard over; a refused or unsettled one leaves it where it was.
+    fn settle_focus(
+        &mut self,
+        outcome: &crate::control_plane::public_contracts::ui_session::CommandOutcome,
+    ) {
+        use crate::control_plane::public_contracts::ui_session::CommandStatus;
+        use tokio::sync::oneshot::error::TryRecvError;
+        if let Some(receipt) = &mut self.focus_receipt {
+            match receipt.try_recv() {
+                Ok(id) => {
+                    self.focus_command_id = Some(id);
+                    self.focus_receipt = None;
+                }
+                Err(TryRecvError::Closed) => self.focus_receipt = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if self.focus_command_id.as_deref() == Some(outcome.request_id.as_str())
+            && !matches!(
+                outcome.status,
+                CommandStatus::Admitted | CommandStatus::DispatcherAccepted
+            )
+        {
+            self.focus_command_id = None;
+            self.focus_landed = outcome.status == CommandStatus::Completed;
+        }
+    }
+
+    /// Whether a focus this view asked for has landed, so the keyboard is due to move.
+    pub fn take_focus_handoff(&mut self) -> bool {
+        std::mem::take(&mut self.focus_landed)
     }
 
     /// A focus that failed because no client was attached: the place to open a
@@ -1586,16 +1628,8 @@ impl App {
                 }
                 let row = crate::ui_session::session::ui_row_id(&row.id.clone());
                 self.focus_request = Some(row.clone());
-                self.submit_session(
-                    crate::control_plane::public_contracts::ui_session::UiAction::RunCommand {
-                        command:
-                            crate::control_plane::public_contracts::ui_session::SharedCommand::Focus,
-                        row: Some(row),
-                    },
-                );
-                // Focusing from the expanded dashboard hands the window back to the
-                // pane being focused.
-                return self.expanded.then_some(Action::ToggleZoom);
+                // The keyboard moves only once this focus lands; see `settle_focus`.
+                self.submit_focus_row(row);
             }
             CommandId::Filter => self.begin_filter_edit(),
             CommandId::NextAttention => {
@@ -2466,14 +2500,41 @@ mod tests {
     }
 
     #[test]
-    fn focusing_from_the_expanded_dashboard_hands_the_window_back() {
+    fn an_expanded_focus_hands_the_keyboard_over_only_once_it_lands() {
+        use crate::control_plane::public_contracts::ui_session::CommandStatus;
         let mut state = ObservationState::new();
         state.apply_success(crate::model::testing::fleet());
         let mut app = App::sidebar();
         app.refresh(&state);
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
         app.toggle_expanded();
-        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::ToggleZoom));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            None,
+            "the window stays expanded until the focus lands"
+        );
+        use crate::control_plane::public_contracts::ui_session::CommandOutcome;
+        let (send, receipt) = tokio::sync::oneshot::channel();
+        app.focus_receipt = Some(receipt);
+        send.send("focus".to_owned()).unwrap();
+        app.settle_focus(&CommandOutcome::new("other", CommandStatus::Completed));
+        assert!(!app.take_focus_handoff());
+        app.settle_focus(&CommandOutcome::new("focus", CommandStatus::Admitted));
+        assert!(
+            !app.take_focus_handoff(),
+            "an admitted focus has not landed"
+        );
+        app.settle_focus(&CommandOutcome::new("focus", CommandStatus::Refused));
+        app.settle_focus(&CommandOutcome::new("focus", CommandStatus::Completed));
+        assert!(
+            !app.take_focus_handoff(),
+            "a settled refusal ended the focus, so a later completion is not ours"
+        );
+
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        app.focus_command_id = Some("next".to_owned());
+        app.settle_focus(&CommandOutcome::new("next", CommandStatus::Completed));
+        assert!(app.take_focus_handoff(), "the completed focus hands over");
+        assert!(!app.take_focus_handoff(), "and the hand-over is taken once");
     }
 
     #[test]

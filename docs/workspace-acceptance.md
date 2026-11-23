@@ -54,8 +54,8 @@ This is the main risk of the outer tmux. Compare against attaching directly:
 |---|---|---|
 | 3.1 | `F10` | focus moves to the sidebar. `F12` moves it back |
 | 3.2 | `j`/`k`, `space`, `/`, `p`, `e`, `b`, `n`/`N`, `w`/`W` | as in the dashboard. By default panes with a command show; finished sessions, exited subjects and unresolved registrations do not, and the footer says how many rows `e` would bring back |
-| 3.3 | `Enter` on an agent row | the agent area switches to that agent's pane; the sidebar stays put |
-| 3.4 | `Enter` on a workspace row | the agent area switches to that session, on the window and pane you last left in it |
+| 3.3 | `Enter` on an agent row | the agent area switches to that agent's pane and takes the keyboard once the switch lands; an expanded sidebar unzooms first |
+| 3.4 | `Enter` on a workspace row | the agent area switches to that session, on the window and pane you last left in it, and takes the keyboard |
 | 3.5 | Rows | compressed: mark and name, plus a state label only when exceptional |
 | 3.6 | Click a row | selects it; a second click focuses it |
 
@@ -64,7 +64,8 @@ This is the main risk of the outer tmux. Compare against attaching directly:
 | # | Do | Expect |
 |---|---|---|
 | 4.1 | In the sidebar, `B` | the sidebar shrinks to a one-column rail of state marks; the agent area grows |
-| 4.2 | `B` again, twice more | back to 32 columns each time, with no drift |
+| 4.2 | `B` again, twice more | back to a quarter of the window, between 32 and 60 columns, each time, with no drift |
+| 4.4 | Resize the terminal with the sidebar shown, hidden or expanded | shown: it stays a quarter of the window within those bounds. Hidden: it stays a rail. Expanded: it stays expanded, and returns to the policy width when unzoomed |
 | 4.3 | Drag-resize the sidebar narrow by mouse | the rail appears below 16 columns on its own, and `B` restores it |
 
 ## 5. Pickers and confirmations over the whole workspace

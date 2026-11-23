@@ -103,6 +103,7 @@ pub struct Admitted {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claimed {
     pub registration_id: crate::identity::RegistrationId,
+    pub parent_subject_id: Option<crate::identity::SubjectId>,
     pub executable: String,
     pub argv: Vec<String>,
 }

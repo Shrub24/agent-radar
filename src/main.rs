@@ -794,6 +794,17 @@ fn run(sidebar: bool) -> io::Result<()> {
                     }
                     dirty = true;
                 }
+                if app.take_focus_handoff()
+                    && let Some(flip) = perform(
+                        Action::HandOff,
+                        &mut app,
+                        &config,
+                        &state,
+                        &mut sidebar_command,
+                    )
+                {
+                    flip_on_success = flip;
+                }
                 if let Some(message) = attach.poll(&mut app) {
                     app.set_focus_message(Some(message));
                     dirty = true;
@@ -926,6 +937,18 @@ fn perform(
                 app,
                 sidebar_command,
             );
+        }
+        // A hosted workspace hands over in one host command, which also unzooms; a
+        // terminal split only gives the window back, when the sidebar was expanded.
+        // The mode follows a command that started, as it does for a zoom.
+        Action::HandOff => {
+            let expanded = app.is_expanded();
+            let (key, command) = match (&config.sidebar.focus_command, expanded) {
+                (Some(_), _) => ("focus_command", &config.sidebar.focus_command),
+                (None, true) => sidebar_zoom(config, app),
+                (None, false) => return None,
+            };
+            return run_host_command(key, command, app, sidebar_command).then_some(expanded);
         }
         Action::LaunchConfigured => {
             // The shell, PATH and command are the invoking terminal's; the place

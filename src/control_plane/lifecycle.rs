@@ -3354,7 +3354,7 @@ pub fn run_launch(socket: &str) -> i32 {
         &claimed.executable,
         &claimed.argv,
         ProcessKind::Agent,
-        true,
+        claimed.parent_subject_id.as_ref(),
     )
 }
 
@@ -3493,7 +3493,7 @@ fn admit_and_enter(
         eprintln!("radar run: the daemon admitted the launch without a registration");
         return 1;
     };
-    enter_scope(&registration_id, &program[0], &program[1..], kind, false)
+    enter_scope(&registration_id, &program[0], &program[1..], kind, None)
 }
 
 /// Becomes `executable argv` inside the registration's scope, so the group exists
@@ -3505,7 +3505,7 @@ fn enter_scope(
     executable: &str,
     argv: &[String],
     kind: ProcessKind,
-    claimed: bool,
+    parent_subject_id: Option<&SubjectId>,
 ) -> i32 {
     let scope = match crate::managed_scope::Scope::for_registration(registration_id.as_str()) {
         Ok(scope) => scope,
@@ -3522,9 +3522,14 @@ fn enter_scope(
         }
     };
     let mut launch = Command::new(launcher);
-    launch.args(&argv).env_remove(SUPERVISION_ENV);
-    if claimed {
-        launch.env_remove(EXECUTION_ENV).env_remove(CORRELATION_ENV);
+    launch
+        .args(&argv)
+        .env_remove(SUPERVISION_ENV)
+        .env_remove(EXECUTION_ENV)
+        .env_remove(CORRELATION_ENV)
+        .env_remove(MANAGED_PARENT_SUBJECT_ENV);
+    if let Some(parent) = parent_subject_id {
+        launch.env(MANAGED_PARENT_SUBJECT_ENV, parent.as_str());
     }
     match kind {
         ProcessKind::Agent => {
