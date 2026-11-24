@@ -306,7 +306,7 @@ impl Session {
             };
         }
         let role = attachment.role;
-        let resolving = matches!(action, dto::UiAction::ResolveInteraction { .. });
+        let previous_request = self.gate.request_id();
         let ordinary = action.is_ordinary();
         let outcome = match if ordinary && gate.is_some_and(|g| g != self.gate.generation()) {
             Err((
@@ -319,11 +319,10 @@ impl Session {
             Ok(interaction_id) => Out::Applied {
                 update_id: self.current.update_id,
                 interaction_id,
-                request_id: if resolving {
-                    self.gate.request_id()
-                } else {
-                    None
-                },
+                request_id: self
+                    .gate
+                    .request_id()
+                    .filter(|id| Some(id) != previous_request.as_ref()),
             },
             Err((code, message)) => Out::Refused { code, message },
         };
@@ -1514,6 +1513,13 @@ mod tests {
         );
         assert!(session.current().state.blocking.is_none());
         let jobs = session.take_completions();
+        assert!(
+            matches!(
+                out,
+                Out::Applied { request_id: Some(ref id), .. } if id == &jobs[0].request_id
+            ),
+            "the focus receipt must identify the dispatched command: {out:?}"
+        );
         assert_eq!(
             match &jobs[0].plan.as_ref().expect("a frozen effect").effect {
                 crate::ui_session::targets::Effect::Focus(target) => Some(target.clone()),
