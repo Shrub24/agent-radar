@@ -2,6 +2,10 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Radar 0.13.3
+
+- The workspace dashboard now receives the focus request ID it needs to unzoom and transfer keyboard focus after Enter or a row click succeeds.
+
 ## Radar 0.13.2
 
 - Managed child launches receive their recorded parent identity so Herdsman can deliver sealed handoffs through Radar.
